@@ -15,15 +15,19 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.stream.Stream;
+import net.minecraft.SharedConstants;
 import net.minecraft.nbt.ByteArrayTag;
 import net.minecraft.nbt.CompoundTag;
 import net.minecraft.nbt.DoubleTag;
 import net.minecraft.nbt.FloatTag;
 import net.minecraft.nbt.NbtAccounter;
 import net.minecraft.nbt.NbtIo;
+import net.minecraft.nbt.NbtUtils;
 import net.minecraft.nbt.NumericTag;
 import net.minecraft.nbt.ListTag;
 import net.minecraft.nbt.Tag;
+import net.minecraft.util.datafix.DataFixTypes;
+import net.minecraft.util.datafix.DataFixers;
 
 /**
  * Entry point and dispatcher for all pre-Anvil world conversions that Mojang
@@ -57,7 +61,7 @@ public final class LegacyMcRegionUpgrader {
         public static final int MCREGION_STORAGE_VERSION = 19132;
         public static final int ANVIL_STORAGE_VERSION = 19133;
 
-        private static final int PARALLELISM = Math.max(1, Math.min(4, Runtime.getRuntime().availableProcessors()));
+        private static final int PARALLELISM = Math.max(1, Math.min(8, Runtime.getRuntime().availableProcessors()));
 
         /** Storage shapes this mod knows how to handle. */
         public enum LegacyFormat {
@@ -176,17 +180,99 @@ public final class LegacyMcRegionUpgrader {
                 Object lock = WORLD_LOCKS.computeIfAbsent(worldDir.toAbsolutePath().normalize(), key -> new Object());
                 synchronized (lock) {
                         LegacyFormat format = detectFormat(worldDir);
+                        String generatorId = generatorIdFor(readLevelDat(worldDir));
                         return switch (format) {
-                                case MCREGION -> convertMcRegionWorld(worldDir);
-                                case PRE_REGION -> convertPreRegionWorld(worldDir);
+                                case MCREGION -> convertMcRegionWorld(worldDir, generatorId);
+                                case PRE_REGION -> convertPreRegionWorld(worldDir, generatorId);
                                 case INDEV -> IndevConverter.convertWorld(worldDir, readLevelDat(worldDir));
                                 default -> true;
                         };
                 }
         }
 
+        /**
+         * Chunk-generator id for the DFU context tag: superflat did not exist
+         * before 1.1, so every legacy world is noise-based except an explicit
+         * "flat" LevelType in level.dat (Beta 1.3 - 1.1 McRegion saves).
+         */
+        static String generatorIdFor(CompoundTag levelDatRoot) {
+                String levelType = levelDatRoot.getCompoundOrEmpty("Data")
+                        .getStringOr("LevelType", "")
+                        .toLowerCase(java.util.Locale.ROOT);
+                return levelType.contains("flat") ? "minecraft:flat" : "minecraft:noise";
+        }
+
+        /**
+         * Vanilla dimension id for a storage root: the world directory itself for
+         * the overworld, or a {@code DIM*} folder ({@code DIM-1} exists since
+         * Alpha 1.2). Other DIM names come from old mods; vanilla ignores them
+         * anyway, so they get overworld treatment.
+         */
+        static String dimensionIdFor(Path dimensionRoot) {
+                String name = dimensionRoot.getFileName().toString();
+                if (name.equals("DIM-1")) {
+                        return "minecraft:the_nether";
+                }
+                if (name.equals("DIM1")) {
+                        return "minecraft:the_end";
+                }
+                return "minecraft:overworld";
+        }
+
+        /**
+         * Runs the datafixer pass on a freshly converted Anvil chunk, so chunks are
+         * written to disk already at the current data version. This replicates
+         * exactly what the vanilla world upgrader would do per chunk
+         * ({@code SimpleRegionStorage#upgradeChunkTag}): a chunk without DataVersion
+         * counts as version -1 (DFU clamps it to its oldest schema), the dimension
+         * and generator go into the {@code __context} tag consumed by the 1.18
+         * blending/height fixes, and the upgraded tag is stamped with the current
+         * data version. The DFU is thread-safe, so this runs inside the parallel
+         * conversion pool - the vanilla upgrade pass afterwards becomes a fast no-op.
+         *
+         * <p>If the upgrade unexpectedly fails, the chunk is returned unchanged
+         * (no DataVersion), and vanilla's own upgrader still converts it later:
+         * slower, but identical output.
+         */
+        static CompoundTag applyVanillaDataFixes(CompoundTag chunkRoot, String dimensionId, String generatorId) {
+                int currentVersion = SharedConstants.getCurrentVersion().dataVersion().version();
+                int version = NbtUtils.getDataVersion(chunkRoot, -1);
+                if (version >= currentVersion) {
+                        return chunkRoot;
+                }
+
+                CompoundTag context = new CompoundTag();
+                context.putString("dimension", dimensionId);
+                context.putString("generator", generatorId);
+                chunkRoot.put("__context", context);
+                try {
+                        CompoundTag upgraded = DataFixTypes.CHUNK.update(DataFixers.getDataFixer(), chunkRoot, version, currentVersion);
+                        upgraded.remove("__context");
+                        NbtUtils.addDataVersion(upgraded, currentVersion);
+                        return upgraded;
+                } catch (RuntimeException e) {
+                        LegacyWorldFix.LOGGER.warn(
+                                "[LegacyWorldFix] In-place data upgrade failed for a chunk at data version {}; written without DataVersion so the vanilla upgrader handles it instead",
+                                version,
+                                e
+                        );
+                        return chunkRoot;
+                } finally {
+                        chunkRoot.remove("__context");
+                }
+        }
+
+        /**
+         * Full per-chunk pipeline: legacy shape &gt; Anvil shape &gt; current data
+         * version. The single entry every converter (McRegion, pre-region, Indev)
+         * uses for each of its chunks.
+         */
+        static CompoundTag transformAndUpgradeChunk(CompoundTag oldRoot, String dimensionId, String generatorId) throws IOException {
+                return applyVanillaDataFixes(transformChunkNbt(oldRoot), dimensionId, generatorId);
+        }
+
         /** Original case: McRegion (.mcr) containers, level.dat version 19132. */
-        private static boolean convertMcRegionWorld(Path worldDir) {
+        private static boolean convertMcRegionWorld(Path worldDir, String generatorId) {
                 long start = System.nanoTime();
                 LegacyWorldFix.LOGGER.info(
                         "[LegacyWorldFix] McRegion world detected (level.dat version {}): {}",
@@ -201,13 +287,20 @@ public final class LegacyMcRegionUpgrader {
                                         for (Path mcr : stream) {
                                                 String fileName = mcr.getFileName().toString();
                                                 Path mca = mcr.resolveSibling(fileName.substring(0, fileName.length() - 4) + ".mca");
-                                                pairs.add(new Path[]{mcr, mca});
+                                                pairs.add(new Path[]{mcr, mca, regionDir.getParent()});
                                         }
                                 }
                         }
 
                         List<Callable<Long>> tasks = pairs.stream().<Callable<Long>>map(pair -> () -> {
-                                long chunks = RegionIo.convertMcRegionToAnvil(pair[0], pair[1], LegacyMcRegionUpgrader::transformChunkNbt);
+                                // pair = {mcr, mca, dimensionRoot}: each region file belongs to
+                                // exactly one dimension, which the DFU context tag needs.
+                                String dimensionId = dimensionIdFor(pair[2]);
+                                long chunks = RegionIo.convertMcRegionToAnvil(
+                                        pair[0],
+                                        pair[1],
+                                        tag -> transformAndUpgradeChunk(tag, dimensionId, generatorId)
+                                );
                                 Files.delete(pair[0]);
                                 return chunks;
                         }).toList();
@@ -227,7 +320,7 @@ public final class LegacyMcRegionUpgrader {
                                 "Converted from McRegion (version 19132) to Anvil (version 19133) by LegacyWorldFix",
                                 regions, chunks);
                         LegacyWorldFix.LOGGER.info(
-                                "[LegacyWorldFix] Converted {} region file(s) / {} chunk(s) from McRegion to Anvil in {} ms - vanilla upgrade chain can take over now",
+                                "[LegacyWorldFix] Converted {} region file(s) / {} chunk(s) from McRegion to Anvil in {} ms (data fixes applied in place) - vanilla upgrade pass is now a no-op",
                                 regions,
                                 chunks,
                                 (System.nanoTime() - start) / 1_000_000L
@@ -244,12 +337,12 @@ public final class LegacyMcRegionUpgrader {
         }
 
         /** Infdev / Alpha loose chunk files, converted straight to Anvil by PreRegionUpgrader. */
-        private static boolean convertPreRegionWorld(Path worldDir) {
+        private static boolean convertPreRegionWorld(Path worldDir, String generatorId) {
                 long start = System.nanoTime();
                 LegacyWorldFix.LOGGER.info("[LegacyWorldFix] Pre-region world detected (Infdev/Alpha chunk files): {}", worldDir);
 
                 try {
-                        long chunks = PreRegionUpgrader.convertToAnvil(worldDir);
+                        long chunks = PreRegionUpgrader.convertToAnvil(worldDir, generatorId);
 
                         patchLevelDat(worldDir.resolve("level.dat"), worldDir.getFileName().toString());
                         Path levelDatOld = worldDir.resolve("level.dat_old");
@@ -261,7 +354,7 @@ public final class LegacyMcRegionUpgrader {
                                 "Converted from pre-region Infdev/Alpha chunk files to Anvil (version 19133) by LegacyWorldFix",
                                 0, chunks);
                         LegacyWorldFix.LOGGER.info(
-                                "[LegacyWorldFix] Converted {} pre-region chunk(s) to Anvil in {} ms - vanilla upgrade chain can take over now",
+                                "[LegacyWorldFix] Converted {} pre-region chunk(s) to Anvil in {} ms (data fixes applied in place) - vanilla upgrade pass is now a no-op",
                                 chunks,
                                 (System.nanoTime() - start) / 1_000_000L
                         );

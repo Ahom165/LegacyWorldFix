@@ -221,7 +221,8 @@ final class IndevConverter {
 
                 CompoundTag root = new CompoundTag();
                 root.put("Level", level);
-                return LegacyMcRegionUpgrader.transformChunkNbt(root);
+                // Indev maps are always overworld, always noise-based (no superflat in 2010).
+                return LegacyMcRegionUpgrader.transformAndUpgradeChunk(root, "minecraft:overworld", "minecraft:noise");
         }
 
         /** 15 (fully lit) for every air block, 0 elsewhere - a sane starting point the light engine will refine. */

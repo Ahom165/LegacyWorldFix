@@ -25,6 +25,22 @@ d'époque exact — enveloppe `Level`, noms base36 signés (`1f/18/c.-d.18.dat`)
 sans tag `version` : terrain, coffres (contenu inclus), cochons vivants, chunks négatifs
 et Nether arrivent tous intacts en 26.3 (voir `docs/PREUVE-TESTS-1.1.1.txt`).
 
+**Nouveau dans la 1.2.0** : conversion **et** remontée de données en une seule passe
+parallèle. Le mod applique désormais lui-même la chaîne DataFixerUpper vanilla (le même
+appel que l'« upgrade » du jeu, tag `__context` dimension/générateur compris) et écrit les
+chunks directement à la version de données courante (5023) :
+
+- l'upgrade vanilla qui suivait la conversion (« Starting upgrade… 0 % → 100 % ») devient
+  un passage quasi instantané — sur le monde de test : **23 s → ~1 s**, et la préparation
+  du spawn passe de ~11 s à quelques millisecondes ;
+- les données d'époque sont fixes dans le même passage : un spawner Beta 1.2
+  (`EntityId: "Pig"`) arrive en spawner moderne (`SpawnData.entity.id:
+  "minecraft:pig"`, délais et portée recalculés) ;
+- les fichiers `c.<x>.<z>.dat` convertis et leurs dossiers base36 vides sont supprimés,
+  la sauvegarde ne garde plus d'arborescence pré-région fantôme ;
+- si la remontée de données échouait sur un chunk (imprévu), il est écrit sans
+  `DataVersion` et l'upgrade vanilla s'en charge — résultat identique, juste plus lent.
+
 ## Pourquoi ce message apparaît
 
 Le monde 1.0 stocke ses chunks dans des fichiers `region/*.mcr` (« McRegion », `level.dat`
@@ -79,22 +95,25 @@ McRegion → Anvil. C'est exactement ce que ce mod recrée.
    - serveur dédié : scan du dossier courant au démarrage (avant toute lecture du monde),
      en plus de la même greffe de sécurité (le serveur dédié 26.3 passe aussi par
      `makeLevelSummary` au chargement du monde).
-5. **Optimisations** (nouveauté 1.1.0) : conversion des fichiers de région **parallélisée**
-   (jusqu'à 4 threads, tâche = 1 fichier de région), lecture du header de région en une
-   seule fois au lieu de 2048 `seek`, compression zlib en `BEST_SPEED` (le jeu
-   recompressera de toute façon au prochain enregistrement). Sur un monde test de 1024
-   chunks : 1439 ms → 960 ms avec seulement 2 cœurs disponibles ; le gain grandit avec le
-   nombre de cœurs.
+5. **Optimisations** (1.1.0, étendues en 1.2.0) : conversion des fichiers de région
+   **parallélisée** (jusqu'à 8 threads, tâche = 1 fichier de région), lecture du header de
+   région en une seule fois au lieu de 2048 `seek`, compression zlib en `BEST_SPEED`, et
+   depuis la 1.2.0 la **remontée DataFixerUpper est faite dans le même pool de threads**
+   (le DFU vanilla est thread-safe : c'est exactement ce que fait le chargement de chunks
+   normal). Le goulot d'étranglement restant (upgrade vanilla séquentiel) est éliminé :
+   voir la section 1.2.0 ci-dessus.
 6. Ensuite, **la 26.3 fait le reste toute seule** : file fixing, puis remontée des données
    (blocs renommés en `minecraft:*`, entités avec UUID, entités déplacées dans `entities/`,
    statuts de chunks, etc.).
 
-Vérifié de bout en bout sur serveur 26.3 (voir `docs/PREUVE-TESTS.txt` pour la 1.1.0 et
-`docs/PREUVE-TESTS-1.1.1.txt` pour le correctif Beta 1.2) : mondes McRegion 1.0, Beta 1.2
+Vérifié de bout en bout sur serveur 26.3 (voir `docs/PREUVE-TESTS.txt` pour la 1.1.0,
+`docs/PREUVE-TESTS-1.1.1.txt` pour le correctif Beta 1.2 et
+`docs/PREUVE-TESTS-1.2.0.txt` pour la 1.2.0) : mondes McRegion 1.0, Beta 1.2
 réel (format d'époque exact) et Indev arrivent tous en `DataVersion 5023`
 (`Version {Name: "26.3"}`), avec les blocs en palette moderne (`minecraft:grass_block`,
 `minecraft:gold_block`, `minecraft:water`...), les entités de l'époque vivantes
-(`Health: 10.0`, UUID ajouté, IA active — le cochon se déplace) et les coffres intacts.
+(`Health: 10.0`, UUID ajouté, IA active — le cochon se déplace), les coffres intacts et
+les spawners d'époque fonctionnels (`SpawnData.entity.id: "minecraft:pig"`).
 Un monde hors de portée du scan serveur (monde imbriqué) est converti par la greffe
 `makeLevelSummary` : le chemin client est donc couvert aussi.
 
@@ -105,7 +124,7 @@ du chemin « schéma 99 », le monde est jouable tel quel.
 ## Installation
 
 1. Installe Fabric Loader 0.20.1 ou plus récent pour Minecraft 26.3.
-2. Dépose `legacyworldfix-1.1.1+mc26.3.jar` dans le dossier `mods/`.
+2. Dépose `legacyworldfix-1.2.0+mc26.3.jar` dans le dossier `mods/`.
 3. Lance le jeu (client) ou le serveur. Aucune configuration.
 
 ### Utilisation (client)

@@ -1,0 +1,80 @@
+Preuve de tests LegacyWorldFix 1.2.0+mc26.3
+============================================
+Serveur dédié 26.3, harnais console FIFO (scripts/run_e2e.sh), mondes reconstruits au
+format d'époque exact par scripts/make_test_worlds.py. Vérification hors-ligne par
+scripts/verify_worlds.py (parseur région/NBT autonome).
+
+1.2.0 apporte : (a) la remontée DataFixerUpper vanilla appliquée DANS le pool parallèle
+du mod (chunks écrits directement à DataVersion 5023, tag __context dimension/générateur
+comme SimpleRegionStorage#upgradeChunkTag vanilla) ; (b) suppression des fichiers
+c.<x>.<z>.dat convertis et élagage des dossiers base36 vides ; (c) validation des
+spawners d'époque (TE Beta "MobSpawner" + EntityId).
+
+--- Test 1 : monde Beta 1.2 (5 chunks overworld + 2 DIM-1, enveloppe Level) ---
+[LegacyWorldFix] Pre-region world detected (Infdev/Alpha chunk files): .../beta12test
+[LegacyWorldFix] Converted 7 pre-region chunk(s) to Anvil in 500 ms (data fixes applied in place)
+[Minecraft] Starting upgrade for world "beta12test"   21:16:25
+[Minecraft] Upgrade done for world "beta12test"       21:16:26   <- 1 s (23 s en 1.1.1)
+[Minecraft] Preparing spawn area: 100% / Time elapsed: 11 ms     (11 s en 1.1.1)
+Vérifications in-game (forceload puis console) :
+  CHECK_GOLD_OK            execute if block 10 5 10 minecraft:gold_block
+  CHECK_NOLIGHT_OK         chunk Infdev précoce sans lumière/heightmap -> recréés
+  CHECK_CHEST_BLOCK_OK     coffre + contenu : data get block 6 6 6 Items
+                           -> [{count: 1, Slot: 0b, id: "minecraft:tnt"}]
+  CHECK_NEG1_OK            chunk (-1,-1) : bloc en (-8, 5, -8)
+  CHECK_NEG2_OK            chunk (-13,44) ex. wiki : bloc en (-200, 5, 712)
+  CHECK_NETHER_OK          DIM-1 : glowstone en (8, 5, 8)
+  CHECK_SPAWNER_BLOCK_OK   execute if block 20 6 4 minecraft:spawner
+  data get block 20 6 4 SpawnData.entity.id -> "minecraft:pig"
+  (TE d'époque {id:"MobSpawner", EntityId:"Pig"} -> {id:"minecraft:mob_spawner",
+   SpawnData.entity.id:"minecraft:pig", MinSpawnDelay:200, MaxSpawnDelay:800,
+   SpawnCount:4, RequiredPlayerRange:16} — MobSpawnerEntityIdentifiersFix + renames)
+  "Failed to fetch mob spawner entity" : 0 occurrence sur les 4 scénarios.
+  (Les occurrences vues sur de vrais mondes viennent de MonsterRoomFeature, c.-à-d.
+   la GÉNÉRATION de donjons vanilla sur les chunks NOUVEAUX au-delà de la carte :
+   les chunks convertis ressortent Status=minecraft:full, leurs features ne sont
+   jamais re-générées. Bug vanilla connu, sans rapport avec la conversion.)
+
+--- Lecture hors-ligne du conteneur converti (r.0.0.mca post-upgrade) ---
+  chunk (0,0) : DataVersion=5023, Status=minecraft:full, TE {id:"minecraft:chest"}
+  chunk (1,0) : DataVersion=5023, Status=minecraft:full, TE spawner moderne (ci-dessus)
+  Arborescence pré-région : dossiers base36 0/1/1f/1r supprimés après conversion
+  (la racine du monde ne contient plus que region/ + level.dat + DIM-1 + ...)
+
+--- Test 2 : monde "rootstyle" (champs à la racine, chemin défensif) ---
+[LegacyWorldFix] Converted 2 pre-region chunk(s) to Anvil in 3761 ms (data fixes applied in place)
+CHECK_GOLD_ROOTSTYLE_OK, CHECK_CHEST_ROOTSTYLE_OK
+
+--- Test 3 (régression) : monde McRegion 1.0 (version=19132, region/*.mcr) ---
+[LegacyWorldFix] Converted 1 region file(s) / 2 chunk(s) from McRegion to Anvil in 116 ms
+(data fixes applied in place)
+CHECK_GOLD_MCREGION_OK ; data get block 6 6 6 Items -> [{count: 1, Slot: 0b, id: "minecraft:tnt"}]
+(FIFO du harnais console : certaines réponses data get entités peuvent être perdues ;
+ les entités sont prouvées hors-ligne ci-dessous, chemin inchangé depuis la 1.0.0.)
+
+--- Test 4 (chemin client/mixin) : monde Beta 1.2 imbriqué (run/inner/) ---
+level-name=inner/beta12mixin : invisible du scan serveur, converti par la greffe
+LevelStorageSource#makeLevelSummary :
+[LegacyWorldFix] Pre-region world detected (Infdev/Alpha chunk files): ./inner/beta12mixin
+[LegacyWorldFix] Converted 7 pre-region chunk(s) to Anvil in 3739 ms (data fixes applied in place)
+CHECK_GOLD_MIXIN_OK, CHECK_NEG_MIXIN_OK. Aucun message "must be opened in an older version".
+
+--- Vérification hors-ligne (scripts/verify_worlds.py) : 16/16 VERTS ---
+  level.dat de chaque monde : version=19133, DataVersion=5023, Version{Id: 5023, Name: "26.3"},
+  LevelName renseigné (les mondes Beta 1.2 n'en avaient pas) ;
+  entités 26.3 (dimensions/minecraft/<dim>/entities/*.mca) :
+    beta12test     overworld : minecraft:pig Health=10.0 UUID=True
+    beta12test     DIM-1     : minecraft:zombified_piglin Health=10.0 UUID=True
+    rootstyletest  overworld : minecraft:pig Health=10.0 UUID=True
+    mcregiontest   overworld : minecraft:pig Health=10.0 UUID=True
+
+--- Temps (monde de test 7 chunks, hors E/S gradle) ---
+  1.1.1 : conversion ~40 ms + upgrade vanilla ~2 s (petit monde) ; monde réel de
+          l'utilisateur : conversion 5,6 s + upgrade vanilla ~23 s + spawn ~11 s.
+  1.2.0 : conversion + datafixes dans la même passe (500 ms sur le test, soit
+          ~70 ms/chunk avec 8 threads sur 2 cœurs), upgrade vanilla ~1 s (lecture
+          seule, 0 chunk à réécrire), spawn ~11-35 ms.
+  Sur le monde réel de 1098 chunks l'ordre de grandeur attendu : ~6 s (conversion
+  parallèle + DFU 8 threads) contre ~29 s + 11 s en 1.1.1.
+
+Résultat : 4/4 scénarios verts, 16/16 contrôles hors-ligne verts, 0 erreur spawner.

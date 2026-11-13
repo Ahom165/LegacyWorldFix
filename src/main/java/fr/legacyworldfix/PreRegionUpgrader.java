@@ -24,11 +24,13 @@ import net.minecraft.nbt.CompoundTag;
  *
  * <p>Each chunk is upgraded with the exact same McRegion -&gt; Anvil
  * transformation used for {@code .mcr} payloads (flat 16x16x128 arrays split
- * into 16 sections, entity health normalization) and written directly into
- * fresh Anvil {@code .mca} region files - one pass, no intermediate McRegion
- * files. The Nether exists since Alpha 1.2 (Halloween update) and is stored
- * the same way inside {@code DIM-1}; every {@code DIM*} folder is converted
- * alongside the overworld.
+ * into 16 sections, entity health normalization) and then pushed through the
+ * vanilla datafixer chain, so every chunk lands on disk already at the
+ * current data version - one pass, no intermediate McRegion files, and the
+ * vanilla world-upgrade pass afterwards becomes a fast no-op. The Nether
+ * exists since Alpha 1.2 (Halloween update) and is stored the same way
+ * inside {@code DIM-1}; every {@code DIM*} folder is converted alongside the
+ * overworld, with its real dimension id feeding the datafixer context.
  */
 final class PreRegionUpgrader {
         record LegacyChunk(int x, int z, Path file, Path dimensionRoot) {
@@ -110,7 +112,7 @@ final class PreRegionUpgrader {
          *
          * @return the number of chunks converted
          */
-        static long convertToAnvil(Path worldDir) throws IOException {
+        static long convertToAnvil(Path worldDir, String generatorId) throws IOException {
                 List<LegacyChunk> chunks = findChunkFiles(worldDir);
                 if (chunks.isEmpty()) {
                         return 0L;
@@ -129,14 +131,15 @@ final class PreRegionUpgrader {
                 for (Map.Entry<Path, List<LegacyChunk>> entry : byRegion.entrySet()) {
                         Path regionFile = entry.getKey();
                         Files.createDirectories(regionFile.getParent());
-                        tasks.add(() -> convertRegionGroup(regionFile, entry.getValue()));
+                        tasks.add(() -> convertRegionGroup(regionFile, entry.getValue(), generatorId));
                 }
 
                 return LegacyMcRegionUpgrader.runInParallel(tasks);
         }
 
-        private static long convertRegionGroup(Path regionFile, List<LegacyChunk> group) throws IOException {
+        private static long convertRegionGroup(Path regionFile, List<LegacyChunk> group, String generatorId) throws IOException {
                 RegionIo.AnvilRegionWriter writer = new RegionIo.AnvilRegionWriter();
+                List<Path> converted = new ArrayList<>();
                 for (LegacyChunk chunk : group) {
                         CompoundTag root;
                         try {
@@ -147,14 +150,54 @@ final class PreRegionUpgrader {
                         }
 
                         try {
-                                writer.writeChunk(slotOf(chunk.x(), chunk.z()), timestampOf(chunk.file()), transform(root, chunk));
+                                writer.writeChunk(slotOf(chunk.x(), chunk.z()), timestampOf(chunk.file()), transform(root, chunk, generatorId));
+                                converted.add(chunk.file());
                         } catch (Exception e) {
                                 LegacyWorldFix.LOGGER.error("[LegacyWorldFix] Skipping corrupt pre-region chunk {}: {}", chunk.file(), e.toString());
                         }
                 }
 
                 writer.saveTo(regionFile);
+                // Only after the region file is safely on disk may the source files go.
+                deleteLegacyChunkFiles(converted);
                 return writer.count();
+        }
+
+        /**
+         * Removes the successfully converted {@code c.<x>.<z>.dat} files and
+         * prunes the empty base36 folders around them (up to the dimension root),
+         * so the save does not keep a stale pre-region tree next to the fresh
+         * region files. Unreadable or corrupt chunk files are deliberately kept:
+         * they still carry data the conversion could not take.
+         */
+        private static void deleteLegacyChunkFiles(List<Path> files) {
+                for (Path file : files) {
+                        try {
+                                Files.delete(file);
+                        } catch (IOException e) {
+                                LegacyWorldFix.LOGGER.warn("[LegacyWorldFix] Could not remove converted pre-region chunk file {}: {}", file, e.toString());
+                                continue;
+                        }
+
+                        Path dir = file.getParent();
+                        for (int depth = 0; depth < 2 && dir != null && isEmptyDirectory(dir) && isBase36FolderName(dir.getFileName().toString()); depth++) {
+                                Path parent = dir.getParent();
+                                try {
+                                        Files.deleteIfExists(dir);
+                                } catch (IOException e) {
+                                        break;
+                                }
+                                dir = parent;
+                        }
+                }
+        }
+
+        private static boolean isEmptyDirectory(Path dir) {
+                try (var entries = Files.newDirectoryStream(dir)) {
+                        return !entries.iterator().hasNext();
+                } catch (IOException e) {
+                        return false;
+                }
         }
 
         /**
@@ -166,7 +209,7 @@ final class PreRegionUpgrader {
          * shape is what makes actual 2010/early-2011 saves convert. Files that
          * carry the fields directly at the root are handled as well.
          */
-        static CompoundTag transform(CompoundTag alphaRoot, LegacyChunk chunk) throws IOException {
+        static CompoundTag transform(CompoundTag alphaRoot, LegacyChunk chunk, String generatorId) throws IOException {
                 CompoundTag wrapped = alphaRoot.getCompoundOrEmpty("Level");
                 CompoundTag level = wrapped.isEmpty() ? alphaRoot : wrapped;
 
@@ -204,7 +247,11 @@ final class PreRegionUpgrader {
 
                 CompoundTag root = new CompoundTag();
                 root.put("Level", level);
-                return LegacyMcRegionUpgrader.transformChunkNbt(root);
+                return LegacyMcRegionUpgrader.transformAndUpgradeChunk(
+                        root,
+                        LegacyMcRegionUpgrader.dimensionIdFor(chunk.dimensionRoot()),
+                        generatorId
+                );
         }
 
         private static void fillIfMissing(CompoundTag level, String name, int size, byte fill) {
