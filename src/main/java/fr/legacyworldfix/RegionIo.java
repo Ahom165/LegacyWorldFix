@@ -12,6 +12,7 @@ import java.io.RandomAccessFile;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
+import java.util.zip.Deflater;
 import java.util.zip.DeflaterOutputStream;
 import java.util.zip.GZIPInputStream;
 import java.util.zip.InflaterInputStream;
@@ -34,11 +35,67 @@ final class RegionIo {
         }
 
         private static final int SECTOR_BYTES = 4096;
+        static final int HEADER_BYTES = 8192;
         private static final int COMPRESSION_GZIP = 1;
         private static final int COMPRESSION_ZLIB = 2;
         private static final int COMPRESSION_NONE = 3;
 
         private RegionIo() {
+        }
+
+        /**
+         * Accumulates transformed chunks and saves them as one complete Anvil
+         * (.mca) region file. Kept independent from any reader so it can be fed
+         * from McRegion containers as well as from loose pre-region chunk files.
+         */
+        static final class AnvilRegionWriter {
+                private final byte[] locations = new byte[4096];
+                private final byte[] timestamps = new byte[4096];
+                private final ByteArrayOutputStream payload = new ByteArrayOutputStream();
+                private int nextSector = 2;
+                private int written;
+
+                void writeChunk(int slot, int timestamp, CompoundTag nbt) throws IOException {
+                        byte[] compressed = zlibNbt(nbt);
+                        int total = compressed.length + 5;
+                        int sectorCount = (total + SECTOR_BYTES - 1) / SECTOR_BYTES;
+                        if (sectorCount > 255) {
+                                throw new IOException("Chunk payload too large: " + total + " bytes");
+                        }
+
+                        writeInt(this.locations, slot * 4, (this.nextSector << 8) | sectorCount);
+                        writeInt(this.timestamps, slot * 4, timestamp);
+
+                        this.payload.write(intBytes(total));
+                        this.payload.write(COMPRESSION_ZLIB);
+                        this.payload.write(compressed);
+                        for (int pad = total; pad < sectorCount * SECTOR_BYTES; pad++) {
+                                this.payload.write(0);
+                        }
+
+                        this.nextSector += sectorCount;
+                        this.written++;
+                }
+
+                int count() {
+                        return this.written;
+                }
+
+                boolean saveTo(Path target) throws IOException {
+                        if (this.written == 0) {
+                                return false;
+                        }
+
+                        ByteArrayOutputStream out = new ByteArrayOutputStream(HEADER_BYTES + this.payload.size());
+                        out.write(this.locations);
+                        out.write(this.timestamps);
+                        this.payload.writeTo(out);
+
+                        Path temp = target.resolveSibling(target.getFileName() + ".legacyworldfix.tmp");
+                        Files.write(temp, out.toByteArray());
+                        Files.move(temp, target, StandardCopyOption.REPLACE_EXISTING);
+                        return true;
+                }
         }
 
         /**
@@ -50,14 +107,9 @@ final class RegionIo {
          * @return the number of chunks written
          */
         static int convertMcRegionToAnvil(Path source, Path target, ChunkTransformer chunkTransformer) throws IOException {
-                int converted = 0;
-                byte[] locations = new byte[4096];
-                byte[] timestamps = new byte[4096];
-                ByteArrayOutputStream payload = new ByteArrayOutputStream();
+                AnvilRegionWriter writer = new AnvilRegionWriter();
 
                 try (RegionReader reader = new RegionReader(source)) {
-                        int nextSector = 2;
-
                         for (int slot = 0; slot < 1024; slot++) {
                                 CompoundTag chunk;
                                 try {
@@ -71,49 +123,33 @@ final class RegionIo {
                                         continue;
                                 }
 
-                                CompoundTag transformed = chunkTransformer.transform(chunk);
-                                byte[] compressed = zlibNbt(transformed);
-                                int total = compressed.length + 5;
-                                int sectorCount = (total + SECTOR_BYTES - 1) / SECTOR_BYTES;
-                                if (sectorCount > 255) {
-                                        throw new IOException("Chunk payload too large: " + total + " bytes");
-                                }
-
-                                writeInt(locations, slot * 4, (nextSector << 8) | sectorCount);
-                                writeInt(timestamps, slot * 4, reader.chunkTimestamp(slot));
-
-                                payload.write(intBytes(total));
-                                payload.write(COMPRESSION_ZLIB);
-                                payload.write(compressed);
-                                for (int pad = total; pad < sectorCount * SECTOR_BYTES; pad++) {
-                                        payload.write(0);
-                                }
-
-                                nextSector += sectorCount;
-                                converted++;
+                                writer.writeChunk(slot, reader.chunkTimestamp(slot), chunkTransformer.transform(chunk));
                         }
                 }
 
-                if (converted > 0) {
-                        ByteArrayOutputStream out = new ByteArrayOutputStream(HEADER_BYTES + payload.size());
-                        out.write(locations);
-                        out.write(timestamps);
-                        payload.writeTo(out);
-
-                        Path temp = target.resolveSibling(target.getFileName() + ".legacyworldfix.tmp");
-                        Files.write(temp, out.toByteArray());
-                        Files.move(temp, target, StandardCopyOption.REPLACE_EXISTING);
-                }
-
-                return converted;
+                writer.saveTo(target);
+                return writer.count();
         }
 
-        private static final int HEADER_BYTES = 8192;
+        /** Reads a loose, gzipped NBT file (pre-region chunk files and old level.dat variants). */
+        static CompoundTag readGzippedNbt(Path file) throws IOException {
+                try (InputStream in = new GZIPInputStream(new BufferedInputStream(Files.newInputStream(file)))) {
+                        return NbtIo.read(new DataInputStream(in), NbtAccounter.unlimitedHeap());
+                }
+        }
 
-        private static byte[] zlibNbt(CompoundTag tag) throws IOException {
+        static byte[] zlibNbt(CompoundTag tag) throws IOException {
                 ByteArrayOutputStream bytes = new ByteArrayOutputStream();
-                try (DeflaterOutputStream deflater = new DeflaterOutputStream(bytes)) {
-                        NbtIo.write(tag, new DataOutputStream(deflater));
+                // BEST_SPEED: the mod only rewrites containers once and the game's own
+                // save pipeline recompresses on the next save anyway, so we optimize for
+                // conversion wall time rather than for file size.
+                Deflater deflater = new Deflater(Deflater.BEST_SPEED);
+                try {
+                        try (DeflaterOutputStream deflaterStream = new DeflaterOutputStream(bytes, deflater)) {
+                                NbtIo.write(tag, new DataOutputStream(deflaterStream));
+                        }
+                } finally {
+                        deflater.end();
                 }
 
                 return bytes.toByteArray();
@@ -130,27 +166,32 @@ final class RegionIo {
                 return new byte[]{(byte) (value >>> 24), (byte) (value >>> 16), (byte) (value >>> 8), (byte) value};
         }
 
+        private static int readInt(byte[] source, int offset) {
+                return ((source[offset] & 0xFF) << 24) | ((source[offset + 1] & 0xFF) << 16) | ((source[offset + 2] & 0xFF) << 8) | (source[offset + 3] & 0xFF);
+        }
+
         private static final class RegionReader implements Closeable {
                 private final RandomAccessFile file;
+                private final byte[] header = new byte[HEADER_BYTES];
 
                 RegionReader(Path path) throws IOException {
                         this.file = new RandomAccessFile(path.toFile(), "r");
+                        // Single 8 KiB read instead of 2048 random seeks over the header.
+                        this.file.readFully(this.header);
                 }
 
-                private long locationValue(int slot) throws IOException {
-                        this.file.seek(4L * slot);
-                        return Integer.toUnsignedLong(this.file.readInt());
+                private int locationValue(int slot) {
+                        return readInt(this.header, slot * 4);
                 }
 
-                int chunkTimestamp(int slot) throws IOException {
-                        this.file.seek(4096L + 4L * slot);
-                        return this.file.readInt();
+                int chunkTimestamp(int slot) {
+                        return readInt(this.header, 4096 + slot * 4);
                 }
 
                 CompoundTag readChunk(int slot) throws IOException {
-                        long location = this.locationValue(slot);
-                        int sectorOffset = (int) (location >> 8);
-                        int sectorCount = (int) (location & 0xFF);
+                        int location = this.locationValue(slot);
+                        int sectorOffset = location >>> 8;
+                        int sectorCount = location & 0xFF;
                         if (sectorOffset == 0 || sectorCount == 0) {
                                 return null;
                         }

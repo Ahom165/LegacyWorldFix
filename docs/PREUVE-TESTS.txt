@@ -1,33 +1,64 @@
-=== PREUVE E2E - LegacyWorldFix 1.0.0 sur serveur Fabric 26.3 ===
+=== PREUVES E2E - LegacyWorldFix 1.1.0 sur serveur Fabric 26.3 ===
 
---- Test 1 : monde McRegion 1.0 (format 2011, level.dat version=19132) ---
-[m[LegacyWorldFix] Loaded - worlds saved before 1.6.4 (McRegion / early Anvil) can be upgraded again
-[m[LegacyWorldFix] McRegion world detected (level.dat version 19132): /home/z/my-project/testserver/legacytest
-[m[LegacyWorldFix] Converted 1 region file(s) / 4 chunk(s) from McRegion to Anvil in 60 ms - vanilla upgrade chain can take over now
-[m[LegacyWorldFix] Converted 1 McRegion world(s) in /home/z/my-project/testserver before server start
-[mStarting upgrade for world "legacytest"
-[mUpgrade done for world "legacytest"
-[Server thread/INFO]: Done (0.386s)! For help, type "help"
+Tous les mondes de test sont générés avec les formats d'époque exacts
+(scripts : scripts/make_pre_region_worlds.py, make_mcregion_world.py,
+make_bench_world.py). Vérifications in-game via la console du serveur.
 
---- Resultat apres conversion + upgrade vanilla ---
-level.dat: version=19133 DataVersion=5023 Version={'Series': 'main', 'Id': 5023, 'Name': '26.3'}
-  DataVersion=5023 Status=? sections=0 blocks=[]
-  entity: id=minecraft:pig Health=10.0 UUID=True
-  DataVersion=5023 Status=minecraft:full sections=24 blocks=[]
-  block_entity: minecraft:chest at 5 5 5 (coffre 1.0 migre)
+--- Test 1 (régression) : monde McRegion 1.0 (level.dat version=19132, region/*.mcr) ---
+[LegacyWorldFix] McRegion world detected (level.dat version 19132): .../legacytest
+[LegacyWorldFix] Converted 1 region file(s) / 4 chunk(s) from McRegion to Anvil in 22 ms
+Starting upgrade for world "legacytest" -> Upgrading progress 0% -> 37% -> Upgrade done
+Chargement runtime + datafix : cochon 2011 vivant et coffre intact :
+  [Server] data get entity @e[type=minecraft:pig,limit=1] Health
+  -> "Pig has the following entity data: 10.0f"
+  [Server] data get block 5 5 5 Items
+  -> "5, 5, 5 has the following block data: []"   (coffre d'origine, items vides)
+level.dat final : version=19133 DataVersion=5023 Version={Series: main, Id: 5023, Name: 26.3}
+entities/r.0.0.mca : entity id=minecraft:pig Health=10.0 UUID=True
 
---- Test 2 : vrai monde genere par le serveur officiel 1.2.5 (2012) ---
-[m[LegacyWorldFix] Loaded - worlds saved before 1.6.4 (McRegion / early Anvil) can be upgraded again
-[mStarting upgrade for world "real125"
-[mUpgrade done for world "real125"
-[Server thread/INFO]: Done (0.383s)! For help, type "help"
+--- Test 2 : monde Infdev/Alpha (chunks c.<x>.<z>.dat gzippés, dossiers base36) ---
+5 chunks dont (1,1), (0,1) et le chunk à coordonnées NÉGATIVES (-1,-1) sans tags
+de lumière/heightmap (style Infdev très précoce) :
+[LegacyWorldFix] Pre-region world detected (Infdev/Alpha chunk files): .../alphatest
+[LegacyWorldFix] Converted 5 pre-region chunk(s) to Anvil in 36 ms
+Starting upgrade for world "alphatest" -> Upgrade done
+Vérifications in-game (forceload puis console) :
+  execute if block 10 5 10 minecraft:gold_block run say CHECK_GOLD_OK
+  -> "CHECK_GOLD_OK"      (bloc d'or placé par le générateur 2010)
+  data get block 5 5 5 Items -> "5, 5, 5 has the following block data: []" (coffre)
+  data get entity @e[type=minecraft:pig,limit=1] Pos
+  -> "[9.42d, 5.0d, 13.0d]"  (le cochon s'est DÉPLACÉ : IA active)
+  data get entity @e[type=minecraft:pig,limit=1] Health -> "10.0f"
+level.dat final : version=19133 DataVersion=5023 Version={Id: 5023, Name: 26.3}
 
---- Test 3 : chemin client (conversion via mixin makeLevelSummary, monde hors scan init) ---
-[m[LegacyWorldFix] Loaded - worlds saved before 1.6.4 (McRegion / early Anvil) can be upgraded again
-[m[LegacyWorldFix] McRegion world detected (level.dat version 19132): saves/legacytest
-[m[LegacyWorldFix] Converted 1 region file(s) / 4 chunk(s) from McRegion to Anvil in 24 ms - vanilla upgrade chain can take over now
-[mStarting upgrade for world "legacytest"
-[mUpgrade done for world "legacytest"
-[Server thread/INFO]: Done (0.402s)! For help, type "help"
+--- Test 3 : monde Indev (carte fixe 256x256x64 dans level.dat, déc. 2009) ---
+[LegacyWorldFix] Indev/Classic world detected (fixed map in level.dat): .../indevtest
+[LegacyWorldFix] Sliced 256x256x64 Indev map into 256 chunk(s) across 1 region file(s) in 343 ms
+Starting upgrade for world "indevtest" -> Upgrade done
+Vérifications in-game :
+  execute if block 10 5 10 minecraft:gold_block -> "CHECK_GOLD_OK"
+  execute if block 52 4 52 minecraft:water      -> "CHECK_WATER_OK"  (bassin d'eau Indev)
+  data get block 5 5 5 Items    -> "5, 5, 5 has the following block data: []"
+  data get entity @e[type=minecraft:pig,limit=1] Health -> "10.0f"
+level.dat final : version=19133 DataVersion=5023 Version={Id: 5023, Name: 26.3}
+(original conservé : level.dat.indev.bak)
 
-Aucun message 'This world must be opened in an older version (like 1.6.4)' dans les 3 tests.
+--- Test 4 : chemin client (mixin makeLevelSummary, monde INVISIBLE du scan serveur) ---
+Monde Alpha placé dans saves/inner/alphamixin avec --universe saves : le scan de
+démarrage ne voit que les dossiers directs, il ne peut donc PAS convertir ce monde.
+C'est la greffe sur LevelStorageSource#makeLevelSummary (appelée par le serveur
+dédié 26.3 via fixAndGetSummaryFromTag) qui déclenche la conversion :
+[LegacyWorldFix] Pre-region world detected (Infdev/Alpha chunk files): saves/inner/alphamixin
+[LegacyWorldFix] Converted 5 pre-region chunk(s) to Anvil in 58 ms
+Starting upgrade for world "inner/alphamixin" -> Upgrade done -> Done (0.349s)
+Aucun message "This world must be opened in an older version".
+
+--- Test 5 : performances (monde McRegion de 1024 chunks / 16 fichiers région) ---
+jar 1.0.0 (séquentiel, deflate par défaut, header lu par seeks) :
+  Converted 16 region file(s) / 1024 chunk(s) from McRegion to Anvil in 1439 ms
+jar 1.1.0 (parallélisé, header bufferisé, deflate BEST_SPEED) :
+  Converted 16 region file(s) / 1024 chunk(s) from McRegion to Anvil in 960 ms
+  soit -33 % sur une machine limitée à 2 coeurs ; le pool passe à 4 threads sinon.
+
+Aucun message "This world must be opened in an older version (like 1.6.4)"
+dans aucun des 5 tests.

@@ -1,25 +1,25 @@
 {
-	"schemaVersion": 1,
-	"id": "legacyworldfix",
-	"version": "${version}",
-	"name": "Legacy World Fix",
-	"description": "Restores the McRegion -> Anvil world conversion that Mojang removed. Worlds saved by Minecraft 1.0 (2011) through 1.6.4 open and upgrade to modern versions again, instead of showing 'This world must be opened in an older version (like 1.6.4) to be safely converted.'",
-	"authors": [
-		"LegacyWorldFix contributors"
-	],
-	"contact": {},
-	"license": "MIT",
-	"environment": "*",
-	"entrypoints": {
-		"main": [
-			"fr.legacyworldfix.LegacyWorldFix"
-		]
-	},
-	"mixins": [
-		"legacyworldfix.mixins.json"
-	],
-	"depends": {
-		"fabricloader": ">=0.20.1",
-		"minecraft": ">=26.3"
-	}
+        "schemaVersion": 1,
+        "id": "legacyworldfix",
+        "version": "${version}",
+        "name": "Legacy World Fix",
+        "description": "Restores the pre-Anvil world conversions that Mojang removed. Worlds saved by Indev/Classic (2009), Infdev/Alpha (2010), Minecraft 1.0 (2011) through 1.6.4 open and upgrade to modern versions again, instead of showing 'This world must be opened in an older version (like 1.6.4) to be safely converted.'",
+        "authors": [
+                "LegacyWorldFix contributors"
+        ],
+        "contact": {},
+        "license": "MIT",
+        "environment": "*",
+        "entrypoints": {
+                "main": [
+                        "fr.legacyworldfix.LegacyWorldFix"
+                ]
+        },
+        "mixins": [
+                "legacyworldfix.mixins.json"
+        ],
+        "depends": {
+                "fabricloader": ">=0.20.1",
+                "minecraft": ">=26.3"
+        }
 }

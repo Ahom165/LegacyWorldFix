@@ -8,134 +8,275 @@ import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.Callable;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.stream.Stream;
 import net.minecraft.nbt.ByteArrayTag;
 import net.minecraft.nbt.CompoundTag;
 import net.minecraft.nbt.DoubleTag;
 import net.minecraft.nbt.FloatTag;
-import net.minecraft.nbt.ListTag;
 import net.minecraft.nbt.NbtAccounter;
 import net.minecraft.nbt.NbtIo;
 import net.minecraft.nbt.NumericTag;
+import net.minecraft.nbt.ListTag;
 import net.minecraft.nbt.Tag;
 
 /**
- * Re-implementation of the McRegion -> Anvil world conversion that Mojang
- * removed from recent versions (the code that used to live in
- * {@code McRegionUpgrader}).
+ * Entry point and dispatcher for all pre-Anvil world conversions that Mojang
+ * removed from recent versions.
  *
- * <p>A world saved by Minecraft 1.0 (November 2011) stores its chunks in
- * {@code region/*.mcr} files ("McRegion") and its level.dat says
- * {@code version: 19132}. Since 26.x the game only reads Anvil
- * ({@code version: 19133}) and refuses such worlds with
- * "This world must be opened in an older version (like 1.6.4) to be safely
- * converted". This class performs the conversion in place:
+ * <p>Since 26.x the game only reads Anvil ({@code version: 19133}) and refuses
+ * anything older with "This world must be opened in an older version (like
+ * 1.6.4) to be safely converted". Three legacy shapes are handled, in
+ * increasing order of age:
  *
  * <ul>
- *   <li>every {@code r.X.Z.mcr} region file is rewritten as {@code r.X.Z.mca}
- *       (the container format is identical, chunk payloads differ);</li>
- *   <li>each chunk's flat 32768-byte block array (order x,z,y - 128 high) is
- *       split into sixteen 4096-byte sections (order y,z,x);</li>
- *   <li>entity health values written by pre-1.6 versions (short) are
- *       normalized to the float representation introduced in 1.6, which is
- *       what the modern data fixer chain expects;</li>
- *   <li>level.dat (and level.dat_old) get {@code version: 19133}.</li>
+ *   <li><b>McRegion</b> (Beta 1.3 - 1.6.4 era, {@code version: 19132}): the
+ *       original case - {@code region/*.mcr} containers are rewritten as
+ *       {@code .mca};</li>
+ *   <li><b>Infdev / Alpha</b> (June 2010 - Beta 1.2): loose gzipped
+ *       {@code c.<x>.<z>.dat} chunk files in base36 folders, upgraded
+ *       directly to Anvil by {@link PreRegionUpgrader};</li>
+ *   <li><b>Indev / Classic</b> (December 2009 - February 2010): one fixed-size
+ *       map inside level.dat, sliced into chunks by {@link IndevConverter}.</li>
  * </ul>
  *
- * <p>The result is byte-for-byte the kind of early-Anvil world that 1.2 to 1.8
- * used to produce, which the 26.x "file fixing" + DataFixerUpper chain (lowest
- * schema 99) is still able to upgrade all the way to the current data version.
+ * <p>All three converge on the same chunk transformation
+ * ({@link #transformChunkNbt}): the flat 16x16x128 block array (order x,z,y)
+ * is split into sixteen 4096-byte sections (order y,z,x) and pre-1.6 short
+ * entity health values are normalized to the float representation introduced
+ * in 1.6. The result is byte-for-byte the kind of early-Anvil world that 1.2
+ * to 1.8 used to produce, which the 26.x "file fixing" + DataFixerUpper chain
+ * (lowest schema 99) still upgrades to the current data version.
  */
 public final class LegacyMcRegionUpgrader {
         public static final int MCREGION_STORAGE_VERSION = 19132;
         public static final int ANVIL_STORAGE_VERSION = 19133;
+
+        private static final int PARALLELISM = Math.max(1, Math.min(4, Runtime.getRuntime().availableProcessors()));
+
+        /** Storage shapes this mod knows how to handle. */
+        public enum LegacyFormat {
+                NONE,
+                /** Already Anvil (19133 or later) - nothing to do. */
+                ANVIL,
+                /** Beta 1.3 - 1.6.4 era region container (19132). */
+                MCREGION,
+                /** Infdev / Alpha loose chunk files. */
+                PRE_REGION,
+                /** Indev / Classic fixed map inside level.dat. */
+                INDEV
+        }
 
         private static final Map<Path, Object> WORLD_LOCKS = new ConcurrentHashMap<>();
 
         private LegacyMcRegionUpgrader() {
         }
 
-        /** Cheap check: does this world still use the McRegion storage version? */
+        /** Cheap check kept for compatibility: does this world still use the McRegion storage version? */
         public static boolean isMcRegionWorld(Path worldDir) {
+                return detectFormat(worldDir) == LegacyFormat.MCREGION;
+        }
+
+        /** True when the world still uses any storage this mod can upgrade. */
+        public static boolean isLegacyWorld(Path worldDir) {
+                LegacyFormat format = detectFormat(worldDir);
+                return format == LegacyFormat.MCREGION || format == LegacyFormat.PRE_REGION || format == LegacyFormat.INDEV;
+        }
+
+        /**
+         * Classifies the world without touching anything. Never throws: unknown or
+         * unreadable worlds count as {@link LegacyFormat#NONE} so vanilla keeps full
+         * control over them.
+         */
+        public static LegacyFormat detectFormat(Path worldDir) {
                 Path levelDat = worldDir.resolve("level.dat");
                 if (!Files.isRegularFile(levelDat)) {
-                        return false;
+                        return LegacyFormat.NONE;
                 }
 
+                CompoundTag root;
                 try {
-                        CompoundTag root = NbtIo.readCompressed(levelDat, NbtAccounter.unlimitedHeap());
-                        return root.getCompoundOrEmpty("Data").getIntOr("version", ANVIL_STORAGE_VERSION) == MCREGION_STORAGE_VERSION;
+                        root = NbtIo.readCompressed(levelDat, NbtAccounter.unlimitedHeap());
                 } catch (IOException | RuntimeException e) {
                         LegacyWorldFix.LOGGER.warn("[LegacyWorldFix] Could not read {}", levelDat, e);
+                        return LegacyFormat.NONE;
+                }
+
+                // Indev / Classic: the whole world is one fixed map at the root.
+                if (IndevConverter.isIndevLevel(root)) {
+                        return LegacyFormat.INDEV;
+                }
+
+                CompoundTag data = root.getCompoundOrEmpty("Data");
+                if (data.isEmpty()) {
+                        return LegacyFormat.NONE;
+                }
+
+                int version = data.getIntOr("version", -1);
+                if (version == MCREGION_STORAGE_VERSION) {
+                        return LegacyFormat.MCREGION;
+                }
+                if (version == ANVIL_STORAGE_VERSION) {
+                        return LegacyFormat.ANVIL;
+                }
+                if (version > ANVIL_STORAGE_VERSION) {
+                        return LegacyFormat.ANVIL;
+                }
+
+                // version == -1 (tag absent, Infdev/Alpha) or any other unknown value:
+                // decide from the directory layout. McRegion .mcr containers win over
+                // loose chunk files, since both could theoretically coexist mid-migration.
+                if (hasMcRegionContainers(worldDir)) {
+                        return LegacyFormat.MCREGION;
+                }
+                if (PreRegionUpgrader.hasLegacyChunkFiles(worldDir)) {
+                        return LegacyFormat.PRE_REGION;
+                }
+                return LegacyFormat.NONE;
+        }
+
+        private static boolean hasMcRegionContainers(Path worldDir) {
+                try (Stream<Path> entries = Files.list(worldDir)) {
+                        Path topRegion = worldDir.resolve("region");
+                        if (Files.isDirectory(topRegion) && hasMcrFiles(topRegion)) {
+                                return true;
+                        }
+                        return entries.filter(Files::isDirectory)
+                                .filter(dir -> dir.getFileName().toString().startsWith("DIM"))
+                                .anyMatch(dir -> hasMcrFiles(dir.resolve("region")));
+                } catch (IOException e) {
+                        return false;
+                }
+        }
+
+        private static boolean hasMcrFiles(Path regionDir) {
+                if (!Files.isDirectory(regionDir)) {
+                        return false;
+                }
+                try (DirectoryStream<Path> stream = Files.newDirectoryStream(regionDir, "r.*.*.mcr")) {
+                        return stream.iterator().hasNext();
+                } catch (IOException e) {
                         return false;
                 }
         }
 
         /**
-         * Converts the world in place if (and only if) it still is a McRegion world.
+         * Converts the world in place if (and only if) it still uses a legacy
+         * storage format. Failures leave level.dat untouched, so the world remains
+         * an honest legacy world and vanilla keeps refusing it (no half states).
          *
          * @return true when the world can be handed to vanilla afterwards
          */
         public static boolean convertWorld(Path worldDir) {
                 Object lock = WORLD_LOCKS.computeIfAbsent(worldDir.toAbsolutePath().normalize(), key -> new Object());
                 synchronized (lock) {
-                        if (!isMcRegionWorld(worldDir)) {
-                                return true;
-                        }
-
-                        long start = System.nanoTime();
-                        LegacyWorldFix.LOGGER.info(
-                                "[LegacyWorldFix] McRegion world detected (level.dat version {}): {}",
-                                MCREGION_STORAGE_VERSION,
-                                worldDir
-                        );
-
-                        try {
-                                List<Path> regionDirs = findRegionDirectories(worldDir);
-                                int regions = 0;
-                                long chunks = 0;
-
-                                for (Path regionDir : regionDirs) {
-                                        try (DirectoryStream<Path> stream = Files.newDirectoryStream(regionDir, "r.*.*.mcr")) {
-                                                for (Path mcr : stream) {
-                                                        String fileName = mcr.getFileName().toString();
-                                                        Path mca = mcr.resolveSibling(fileName.substring(0, fileName.length() - 4) + ".mca");
-                                                        chunks += RegionIo.convertMcRegionToAnvil(mcr, mca, LegacyMcRegionUpgrader::transformChunkNbt);
-                                                        Files.delete(mcr);
-                                                        regions++;
-                                                }
-                                        }
-                                }
-
-                                // level.dat is rewritten last: if anything above failed, the world is
-                                // still an honest McRegion world and the vanilla refusal stays in place.
-                                patchLevelDat(worldDir.resolve("level.dat"));
-                                Path levelDatOld = worldDir.resolve("level.dat_old");
-                                if (Files.isRegularFile(levelDatOld)) {
-                                        patchLevelDat(levelDatOld);
-                                }
-
-                                writeMarker(worldDir, regions, chunks);
-                                LegacyWorldFix.LOGGER.info(
-                                        "[LegacyWorldFix] Converted {} region file(s) / {} chunk(s) from McRegion to Anvil in {} ms - vanilla upgrade chain can take over now",
-                                        regions,
-                                        chunks,
-                                        (System.nanoTime() - start) / 1_000_000L
-                                );
-                                return true;
-                        } catch (Exception e) {
-                                LegacyWorldFix.LOGGER.error(
-                                        "[LegacyWorldFix] Failed to convert McRegion world {}. level.dat was left untouched; fix the cause (or restore a backup) and retry.",
-                                        worldDir,
-                                        e
-                                );
-                                return false;
-                        }
+                        LegacyFormat format = detectFormat(worldDir);
+                        return switch (format) {
+                                case MCREGION -> convertMcRegionWorld(worldDir);
+                                case PRE_REGION -> convertPreRegionWorld(worldDir);
+                                case INDEV -> IndevConverter.convertWorld(worldDir, readLevelDat(worldDir));
+                                default -> true;
+                        };
                 }
         }
 
-        /** Converts every McRegion world directly inside the given directory (server universe / saves folder). */
+        /** Original case: McRegion (.mcr) containers, level.dat version 19132. */
+        private static boolean convertMcRegionWorld(Path worldDir) {
+                long start = System.nanoTime();
+                LegacyWorldFix.LOGGER.info(
+                        "[LegacyWorldFix] McRegion world detected (level.dat version {}): {}",
+                        MCREGION_STORAGE_VERSION,
+                        worldDir
+                );
+
+                try {
+                        List<Path[]> pairs = new ArrayList<>();
+                        for (Path regionDir : findRegionDirectories(worldDir)) {
+                                try (DirectoryStream<Path> stream = Files.newDirectoryStream(regionDir, "r.*.*.mcr")) {
+                                        for (Path mcr : stream) {
+                                                String fileName = mcr.getFileName().toString();
+                                                Path mca = mcr.resolveSibling(fileName.substring(0, fileName.length() - 4) + ".mca");
+                                                pairs.add(new Path[]{mcr, mca});
+                                        }
+                                }
+                        }
+
+                        List<Callable<Long>> tasks = pairs.stream().<Callable<Long>>map(pair -> () -> {
+                                long chunks = RegionIo.convertMcRegionToAnvil(pair[0], pair[1], LegacyMcRegionUpgrader::transformChunkNbt);
+                                Files.delete(pair[0]);
+                                return chunks;
+                        }).toList();
+                        long chunks = runInParallel(tasks);
+
+                        int regions = pairs.size();
+
+                        // level.dat is rewritten last: if anything above failed, the world is
+                        // still an honest McRegion world and the vanilla refusal stays in place.
+                        patchLevelDat(worldDir.resolve("level.dat"), worldDir.getFileName().toString());
+                        Path levelDatOld = worldDir.resolve("level.dat_old");
+                        if (Files.isRegularFile(levelDatOld)) {
+                                patchLevelDat(levelDatOld, worldDir.getFileName().toString());
+                        }
+
+                        writeMarker(worldDir, "converted-from-mcregion.txt",
+                                "Converted from McRegion (version 19132) to Anvil (version 19133) by LegacyWorldFix",
+                                regions, chunks);
+                        LegacyWorldFix.LOGGER.info(
+                                "[LegacyWorldFix] Converted {} region file(s) / {} chunk(s) from McRegion to Anvil in {} ms - vanilla upgrade chain can take over now",
+                                regions,
+                                chunks,
+                                (System.nanoTime() - start) / 1_000_000L
+                        );
+                        return true;
+                } catch (Exception e) {
+                        LegacyWorldFix.LOGGER.error(
+                                "[LegacyWorldFix] Failed to convert McRegion world {}. level.dat was left untouched; fix the cause (or restore a backup) and retry.",
+                                worldDir,
+                                e
+                        );
+                        return false;
+                }
+        }
+
+        /** Infdev / Alpha loose chunk files, converted straight to Anvil by PreRegionUpgrader. */
+        private static boolean convertPreRegionWorld(Path worldDir) {
+                long start = System.nanoTime();
+                LegacyWorldFix.LOGGER.info("[LegacyWorldFix] Pre-region world detected (Infdev/Alpha chunk files): {}", worldDir);
+
+                try {
+                        long chunks = PreRegionUpgrader.convertToAnvil(worldDir);
+
+                        patchLevelDat(worldDir.resolve("level.dat"), worldDir.getFileName().toString());
+                        Path levelDatOld = worldDir.resolve("level.dat_old");
+                        if (Files.isRegularFile(levelDatOld)) {
+                                patchLevelDat(levelDatOld, worldDir.getFileName().toString());
+                        }
+
+                        writeMarker(worldDir, "converted-from-alpha.txt",
+                                "Converted from pre-region Infdev/Alpha chunk files to Anvil (version 19133) by LegacyWorldFix",
+                                0, chunks);
+                        LegacyWorldFix.LOGGER.info(
+                                "[LegacyWorldFix] Converted {} pre-region chunk(s) to Anvil in {} ms - vanilla upgrade chain can take over now",
+                                chunks,
+                                (System.nanoTime() - start) / 1_000_000L
+                        );
+                        return true;
+                } catch (Exception e) {
+                        LegacyWorldFix.LOGGER.error(
+                                "[LegacyWorldFix] Failed to convert pre-region world {}. level.dat was left untouched; fix the cause (or restore a backup) and retry.",
+                                worldDir,
+                                e
+                        );
+                        return false;
+                }
+        }
+
+        /** Converts every legacy world directly inside the given directory (server universe / saves folder). */
         public static int convertAllInDirectory(Path directory) {
                 if (!Files.isDirectory(directory)) {
                         return 0;
@@ -144,18 +285,80 @@ public final class LegacyMcRegionUpgrader {
                 int converted = 0;
                 try (Stream<Path> entries = Files.list(directory)) {
                         for (Path candidate : entries.filter(Files::isDirectory).toList()) {
-                                if (isMcRegionWorld(candidate) && convertWorld(candidate)) {
+                                if (isLegacyWorld(candidate) && convertWorld(candidate)) {
                                         converted++;
                                 }
                         }
                 } catch (IOException e) {
-                        LegacyWorldFix.LOGGER.error("[LegacyWorldFix] Failed to scan {} for McRegion worlds", directory, e);
+                        LegacyWorldFix.LOGGER.error("[LegacyWorldFix] Failed to scan {} for legacy worlds", directory, e);
                 }
 
                 return converted;
         }
 
-        /** Transforms one McRegion chunk NBT (root with "Level") into an early-Anvil chunk NBT. */
+        /**
+         * Runs independent conversion tasks with a small worker pool. Region files
+         * are the unit of work: they never share state, so parallelism is safe and
+         * scales with cores on big worlds (the historical code was strictly
+         * sequential).
+         */
+        static long runInParallel(List<Callable<Long>> tasks) throws IOException {
+                if (tasks.isEmpty()) {
+                        return 0L;
+                }
+                if (tasks.size() == 1 || PARALLELISM == 1) {
+                        long total = 0L;
+                        for (Callable<Long> task : tasks) {
+                                try {
+                                        total += task.call();
+                                } catch (IOException e) {
+                                        throw e;
+                                } catch (Exception e) {
+                                        throw new IOException(e);
+                                }
+                        }
+                        return total;
+                }
+
+                ExecutorService pool = Executors.newFixedThreadPool(PARALLELISM, runnable -> {
+                        Thread thread = new Thread(runnable, "LegacyWorldFix-Converter");
+                        thread.setDaemon(true);
+                        return thread;
+                });
+                try {
+                        long total = 0L;
+                        try {
+                                for (Future<Long> future : pool.invokeAll(tasks)) {
+                                        try {
+                                                total += future.get();
+                                        } catch (ExecutionException e) {
+                                                throw e.getCause() instanceof IOException io ? io : new IOException(e.getCause());
+                                        }
+                                }
+                        } catch (InterruptedException e) {
+                                Thread.currentThread().interrupt();
+                                throw new IOException("Interrupted during conversion", e);
+                        }
+                        return total;
+                } finally {
+                        pool.shutdown();
+                }
+        }
+
+        /** Reads level.dat, tolerating absence for the Indev path (its caller validates). */
+        private static CompoundTag readLevelDat(Path worldDir) {
+                try {
+                        return NbtIo.readCompressed(worldDir.resolve("level.dat"), NbtAccounter.unlimitedHeap());
+                } catch (IOException | RuntimeException e) {
+                        return new CompoundTag();
+                }
+        }
+
+        /**
+         * Transforms one McRegion chunk NBT (root with "Level") into an early-Anvil chunk NBT.
+         * Also used by the Infdev/Alpha and Indev converters, whose generated chunks go
+         * through exactly the same pipeline as converted McRegion chunks.
+         */
         static CompoundTag transformChunkNbt(CompoundTag oldRoot) throws IOException {
                 CompoundTag oldLevel = oldRoot.getCompoundOrEmpty("Level");
                 byte[] blocks = byteArray(oldLevel, "Blocks", 32768);
@@ -256,10 +459,15 @@ public final class LegacyMcRegionUpgrader {
                 }
         }
 
-        private static void patchLevelDat(Path levelDat) throws IOException {
+        private static void patchLevelDat(Path levelDat, String defaultLevelName) throws IOException {
                 CompoundTag root = NbtIo.readCompressed(levelDat, NbtAccounter.unlimitedHeap());
                 CompoundTag data = root.getCompoundOrEmpty("Data");
                 data.putInt("version", ANVIL_STORAGE_VERSION);
+
+                // Pre-Beta 1.8 saves have no LevelName; the world list needs one.
+                if (data.getStringOr("LevelName", "").isEmpty()) {
+                        data.putString("LevelName", defaultLevelName);
+                }
 
                 if (data.contains("Player")) {
                         CompoundTag player = data.getCompoundOrEmpty("Player");
@@ -269,6 +477,23 @@ public final class LegacyMcRegionUpgrader {
                 }
 
                 NbtIo.writeCompressed(root, levelDat);
+        }
+
+        /**
+         * Mirrors a successful on-disk conversion into the in-memory tag that the
+         * caller of makeLevelSummary already holds, so the very world list refresh
+         * that triggered us sees the world as Anvil instead of re-reading level.dat.
+         *
+         * <p>The tag received here is the <b>Data</b> compound itself: both vanilla
+         * call sites of makeLevelSummary wrap {@code root.getCompoundOrEmpty("Data")}
+         * in their Dynamic and {@link net.minecraft.world.level.storage.LevelVersion}
+         * reads {@code version} at that level.
+         */
+        public static void patchInMemoryTag(CompoundTag dataLevelTag, Path worldDir) {
+                dataLevelTag.putInt("version", ANVIL_STORAGE_VERSION);
+                if (dataLevelTag.getStringOr("LevelName", "").isEmpty()) {
+                        dataLevelTag.putString("LevelName", worldDir.getFileName().toString());
+                }
         }
 
         private static List<Path> findRegionDirectories(Path worldDir) throws IOException {
@@ -289,15 +514,17 @@ public final class LegacyMcRegionUpgrader {
                 return result;
         }
 
-        private static void writeMarker(Path worldDir, int regions, long chunks) throws IOException {
+        private static void writeMarker(Path worldDir, String fileName, String title, int regions, long chunks) throws IOException {
                 Path markerDir = worldDir.resolve("legacyworldfix");
                 Files.createDirectories(markerDir);
-                Path marker = markerDir.resolve("converted-from-mcregion.txt");
-                String content = "Converted from McRegion (version 19132) to Anvil (version 19133) by LegacyWorldFix\n"
-                        + "Date: " + Instant.now() + "\n"
-                        + "Region files: " + regions + "\n"
-                        + "Chunks: " + chunks + "\n";
-                Files.writeString(marker, content);
+                StringBuilder content = new StringBuilder()
+                        .append(title).append('\n')
+                        .append("Date: ").append(Instant.now()).append('\n');
+                if (regions > 0) {
+                        content.append("Region files: ").append(regions).append('\n');
+                }
+                content.append("Chunks: ").append(chunks).append('\n');
+                Files.writeString(markerDir.resolve(fileName), content.toString());
         }
 
         private static byte[] byteArray(CompoundTag tag, String name, int expectedSize) throws IOException {
@@ -307,13 +534,13 @@ public final class LegacyMcRegionUpgrader {
                 }
 
                 if (!(raw instanceof ByteArrayTag arrayTag) || arrayTag.getAsByteArray().length != expectedSize) {
-                        throw new IOException("Unexpected '" + name + "' array in McRegion chunk");
+                        throw new IOException("Unexpected '" + name + "' array in legacy chunk");
                 }
 
                 return arrayTag.getAsByteArray();
         }
 
-        private static int getNibble(byte[] array, int index) {
+        static int getNibble(byte[] array, int index) {
                 if (array.length == 0) {
                         return 0;
                 }
@@ -322,7 +549,7 @@ public final class LegacyMcRegionUpgrader {
                 return (index & 1) == 0 ? value & 0x0F : value >> 4;
         }
 
-        private static void setNibble(byte[] array, int index, int value) {
+        static void setNibble(byte[] array, int index, int value) {
                 int i = index >> 1;
                 if ((index & 1) == 0) {
                         array[i] = (byte) ((array[i] & 0xF0) | (value & 0x0F));

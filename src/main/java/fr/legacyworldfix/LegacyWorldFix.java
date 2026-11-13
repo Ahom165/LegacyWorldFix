@@ -14,7 +14,7 @@ public class LegacyWorldFix implements ModInitializer {
 
         @Override
         public void onInitialize() {
-                LOGGER.info("[LegacyWorldFix] Loaded - worlds saved before 1.6.4 (McRegion / early Anvil) can be upgraded again");
+                LOGGER.info("[LegacyWorldFix] Loaded - worlds saved before 1.6.4 (Indev/Classic, Infdev/Alpha, McRegion, early Anvil) can be upgraded again");
 
                 // On a dedicated server, convert every legacy world before the server entry
                 // point reads level.dat, so the "must be opened in an older version" refusal
@@ -23,7 +23,7 @@ public class LegacyWorldFix implements ModInitializer {
                         Path universe = Paths.get("").toAbsolutePath();
                         int converted = LegacyMcRegionUpgrader.convertAllInDirectory(universe);
                         if (converted > 0) {
-                                LOGGER.info("[LegacyWorldFix] Converted {} McRegion world(s) in {} before server start", converted, universe);
+                                LOGGER.info("[LegacyWorldFix] Converted {} legacy world(s) in {} before server start", converted, universe);
                         }
                 }
         }
