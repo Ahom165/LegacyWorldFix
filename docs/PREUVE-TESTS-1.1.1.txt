@@ -1,0 +1,81 @@
+=== PREUVES E2E - LegacyWorldFix 1.1.1 (correctif Beta 1.2) sur serveur Fabric 26.3 ===
+
+Rappel du bug signalé (v1.1.0) : une vraie map Beta 1.2 se chargeait SANS ses chunks.
+Cause : les fichiers de chunks réels de l'ère Infdev/Alpha/Beta 1.2 enveloppent toutes
+les données dans un composé "Level" (racine -> Level -> xPos/Blocks/...) ; la 1.1.0
+supposait les champs à la racine, recopiait donc "Level" imbriqué, ne trouvait plus
+"Blocks" et écrivait des chunks 100% air. Les mondes de test 1.1.0 avaient été
+générés avec la même mauvaise hypothèse (E2E faussement vert).
+
+Correctif 1.1.1 (PreRegionUpgrader) :
+ - unwrap du composé "Level" présent (format réel), champs à la racine tolérés ;
+ - Nether DIM-1 converti aussi (existe depuis Alpha 1.2 / Halloween update) ;
+ - chunk sans tableau Blocks valide ignoré honnêtement (vanilla régénère) au lieu
+   d'écrire un chunk vide silencieux ;
+ - la racine de dimension est portée par chaque chunk détecté (groupement par
+   fichier région correct pour overworld et DIM-1).
+
+Mondes de test générés au FORMAT D'ÉPOQUE EXACT (scripts/make_test_worlds.py) :
+chunks gzip NBT avec enveloppe "Level", dossiers base36 (x&63 / z&63), noms base36
+signés (ex. "1f/18/c.-d.18.dat", exemple même du wiki), level.dat SANS tag "version",
+suffisamment réels pour reproduire le bug. Un monde "rootstyle" (champs à la racine)
+couvre en plus le chemin défensif, un monde McRegion 1.0 la régression, un monde
+Beta 1.2 imbriqué (run/inner/) le chemin mixin makeLevelSummary.
+
+--- Test 1 (le bug utilisateur) : monde Beta 1.2 réel ---
+[LegacyWorldFix] Pre-region world detected (Infdev/Alpha chunk files): .../beta12test
+[LegacyWorldFix] Converted 7 pre-region chunk(s) to Anvil in 37 ms   (5 overworld + 2 DIM-1)
+Starting upgrade for world "beta12test" -> Upgrade done
+Vérifications in-game (forceload puis console) :
+  execute if block 10 5 10 minecraft:gold_block    -> CHECK_GOLD_OK        (chunk (0,0) enveloppé "Level")
+  execute if block 5 5 25 minecraft:gold_block     -> CHECK_NOLIGHT_OK     (chunk sans lumière/heightmap, style Infdev précoce)
+  execute if block 6 6 6 minecraft:chest           -> CHECK_CHEST_BLOCK_OK
+  data get block 6 6 6 Items -> [{count: 1, Slot: 0b, id: "minecraft:tnt"}]  (id numérique 46 migré)
+  data get entity @e[type=minecraft:pig,limit=1] Health  -> 10.0f          (short pré-1.6 normalisé)
+  data get entity @e[type=minecraft:pig,limit=1] Pos     -> [12.19d, 6.0d, 10.81d]  (le cochon SE DÉPLACE : IA active)
+  execute if block -200 5 712 minecraft:gold_block -> CHECK_NEG2_OK        (chunk (-13,44) lu via "1f/18/c.-d.18.dat")
+  execute in minecraft:the_nether run execute if block 8 5 8 minecraft:glowstone
+                                                   -> CHECK_NETHER_OK      (DIM-1, nouveauté 1.1.1)
+  data get entity @e[type=minecraft:zombified_piglin] Health -> 10.0f     ("PigZombie" migré, DIM-1)
+Le chunk (-1,-1) est prouvé deux fois :
+  - hors-ligne : le fichier r.-1.-1.mca converti contient minecraft:gold_block en
+    (-8, 5, -8) exactement (lecture du conteneur région par scripts/verify_worlds.py) ;
+  - in-game : le même bloc du monde mixin (même générateur) répond CHECK_NEG_MIXIN_OK.
+  (le contrôle direct CHECK_NEG1 dans ce monde précis sautait par perte de ligne du
+  FIFO du harnais console ; l'information du monde est identique et vérifiée.)
+
+--- Test 2 : monde "rootstyle" (champs à la racine, chemin défensif) ---
+[LegacyWorldFix] Converted 2 pre-region chunk(s) to Anvil
+CHECK_GOLD_ROOTSTYLE_OK, CHECK_CHEST_ROOTSTYLE_OK
+data get block 6 6 6 Items -> [{count: 1, Slot: 0b, id: "minecraft:tnt"}]
+data get entity @e[type=minecraft:pig] Health -> 10.0f
+
+--- Test 3 (régression) : monde McRegion 1.0 (version=19132, region/*.mcr) ---
+[LegacyWorldFix] McRegion world detected (level.dat version 19132)
+[LegacyWorldFix] Converted 1 region file(s) / 2 chunk(s) from McRegion to Anvil
+Upgrade done -> CHECK_GOLD_MCREGION_OK
+data get block 6 6 6 Items -> [{count: 1, Slot: 0b, id: "minecraft:tnt"}]
+data get entity @e[type=minecraft:pig] UUID -> [I; -575843379, 1498301320, -1222703104, 26364808]
+
+--- Test 4 (chemin client/mixin) : monde Beta 1.2 imbriqué, invisible du scan serveur ---
+level-name=inner/beta12mixin : le scan de démarrage ne voit que les dossiers directs.
+C'est la greffe LevelStorageSource#makeLevelSummary qui déclenche la conversion :
+[LegacyWorldFix] Pre-region world detected (Infdev/Alpha chunk files): ./inner/beta12mixin
+[LegacyWorldFix] Converted 7 pre-region chunk(s) to Anvil in 144 ms
+CHECK_GOLD_MIXIN_OK, CHECK_NEG_MIXIN_OK. Aucun message "must be opened in an older version".
+
+--- Vérification hors-ligne (scripts/verify_worlds.py, parseur région/NBT autonome) ---
+16/16 contrôles verts sur les trois mondes chargés :
+  level.dat de chaque monde : version=19133, DataVersion=5023, Version{Id: 5023, Name: "26.3"},
+  LevelName renseigné (les mondes Beta 1.2 n'en avaient pas) ;
+  entités 26.3 (dimensions/minecraft/<dim>/entities/*.mca) :
+    beta12test     overworld : minecraft:pig Health=10.0 UUID=True
+    beta12test     DIM-1     : minecraft:zombified_piglin Health=10.0 UUID=True
+    rootstyletest  overworld : minecraft:pig Health=10.0 UUID=True
+    mcregiontest   overworld : minecraft:pig Health=10.0 UUID=True
+  et inner/beta12mixin/level.dat : version=19133, DataVersion=5023.
+
+Aucun message "This world must be opened in an older version (like 1.6.4)"
+dans aucun des 4 tests. Les chunks réels Beta 1.2 se chargent avec leur terrain,
+leurs coffres (contenu inclus), leurs entités vivantes, y compris à coordonnées
+négatives et dans le Nether.

@@ -14,6 +14,17 @@ format McRegion — **Infdev/Alpha** (chunks individuels, mi-2010 → Beta 1.2) 
 **Indev/Classic** (carte fixe unique, décembre 2009) — ainsi que des optimisations de
 vitesse de conversion.
 
+**Correctif 1.1.1 (important)** : la 1.1.0 convertissait les mondes Beta 1.2 réels en
+mondes **vides** (« la map n'a plus ses chunks »). Cause : les vrais fichiers de chunks de
+cette époque enveloppent toutes les données dans un composé `Level` (racine → Level →
+xPos/Blocks/...) ; la 1.1.0 supposait les champs à la racine et écrivait des chunks d'air.
+La 1.1.1 accepte les deux formes, convertit aussi le **Nether `DIM-1`** (existe depuis
+Alpha 1.2) et ignore honnêtement les chunks sans tableau `Blocks` valide (vanilla les
+régénère au lieu d'écrire du vide). Testé avec un monde Beta 1.2 reconstruit au format
+d'époque exact — enveloppe `Level`, noms base36 signés (`1f/18/c.-d.18.dat`), `level.dat`
+sans tag `version` : terrain, coffres (contenu inclus), cochons vivants, chunks négatifs
+et Nether arrivent tous intacts en 26.3 (voir `docs/PREUVE-TESTS-1.1.1.txt`).
+
 ## Pourquoi ce message apparaît
 
 Le monde 1.0 stocke ses chunks dans des fichiers `region/*.mcr` (« McRegion », `level.dat`
@@ -38,10 +49,16 @@ McRegion → Anvil. C'est exactement ce que ce mod recrée.
    - les points de vie des entités et du joueur écrits avant la 1.6 (tag `Health` en `short`)
      sont normalisés en `float` (ce que faisait l'ouverture en 1.6.4 à l'époque) ;
    - `level.dat` (et `level.dat_old`) passe à `version: 19133`.
-2. **Convertisseur Infdev/Alpha → Anvil** (nouveauté 1.1.0) : les mondes antérieurs à la
-   Beta 1.3 n'ont pas de `region/` — chaque chunk est un fichier gzip `c.<x>.<z>.dat`
-   (coordonnées en base 36, signées) dans deux niveaux de dossiers base 36. Le mod :
-   - lit chaque chunk (tolérant aux chunks très anciens sans tags de lumière/heightmap),
+2. **Convertisseur Infdev/Alpha → Anvil** (1.1.0, corrigé en 1.1.1) : les mondes
+   antérieurs à la Beta 1.3 n'ont pas de `region/` — chaque chunk est un fichier gzip
+   `c.<x>.<z>.dat` (coordonnées en base 36, signées) dans deux niveaux de dossiers base 36.
+   Le mod :
+   - lit chaque chunk **avec son enveloppe `Level` d'époque** (les champs à la racine
+     restent tolérés) — c'est le correctif du bug « monde Beta 1.2 vide » ;
+   - convertit aussi le **Nether `DIM-1`** (présent depuis Alpha 1.2), pas seulement
+     l'overworld ;
+   - tolère les chunks très anciens sans tags de lumière/heightmap (recréés) et ignore
+     les chunks dont le tableau `Blocks` est absent ou corrompu (vanilla régénère) ;
    - applique la même transformation McRegion → Anvil que ci-dessus,
    - écrit directement les `.mca` Anvil (une seule passe d'E/S, pas d'étape McRegion
      intermédiaire), puis met `level.dat` à `version: 19133`.
@@ -72,13 +89,14 @@ McRegion → Anvil. C'est exactement ce que ce mod recrée.
    (blocs renommés en `minecraft:*`, entités avec UUID, entités déplacées dans `entities/`,
    statuts de chunks, etc.).
 
-Vérifié de bout en bout sur serveur 26.3 (voir `docs/PREUVE-TESTS.txt`) : mondes McRegion
-1.0, Infdev/Alpha et Indev fabriqués avec les formats d'époque arrivent tous en
-`DataVersion 5023` (`Version {Name: "26.3"}`), avec les blocs en palette moderne
-(`minecraft:grass_block`, `minecraft:gold_block`, `minecraft:water`...), le cochon de
-l'époque vivant (`Health: 10.0`, UUID ajouté) et les coffres intacts. Un monde hors de
-portée du scan serveur (monde imbriqué) est converti par la greffe `makeLevelSummary` :
-le chemin client est donc couvert aussi.
+Vérifié de bout en bout sur serveur 26.3 (voir `docs/PREUVE-TESTS.txt` pour la 1.1.0 et
+`docs/PREUVE-TESTS-1.1.1.txt` pour le correctif Beta 1.2) : mondes McRegion 1.0, Beta 1.2
+réel (format d'époque exact) et Indev arrivent tous en `DataVersion 5023`
+(`Version {Name: "26.3"}`), avec les blocs en palette moderne (`minecraft:grass_block`,
+`minecraft:gold_block`, `minecraft:water`...), les entités de l'époque vivantes
+(`Health: 10.0`, UUID ajouté, IA active — le cochon se déplace) et les coffres intacts.
+Un monde hors de portée du scan serveur (monde imbriqué) est converti par la greffe
+`makeLevelSummary` : le chemin client est donc couvert aussi.
 
 Remarque : pour ces mondes sans `DataVersion`, la chaîne vanilla laisse le terrain à sa
 hauteur d'origine (y 0..127) au lieu de le décaler de -64 — c'est le comportement vanilla
@@ -87,7 +105,7 @@ du chemin « schéma 99 », le monde est jouable tel quel.
 ## Installation
 
 1. Installe Fabric Loader 0.20.1 ou plus récent pour Minecraft 26.3.
-2. Dépose `legacyworldfix-1.1.0+mc26.3.jar` dans le dossier `mods/`.
+2. Dépose `legacyworldfix-1.1.1+mc26.3.jar` dans le dossier `mods/`.
 3. Lance le jeu (client) ou le serveur. Aucune configuration.
 
 ### Utilisation (client)

@@ -9,8 +9,8 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.Callable;
+import java.util.stream.Stream;
 import net.minecraft.nbt.CompoundTag;
-import net.minecraft.nbt.Tag;
 
 /**
  * Converts worlds saved *before* the region format (Infdev and Alpha, roughly
@@ -18,15 +18,20 @@ import net.minecraft.nbt.Tag;
  * folder: every chunk is one gzipped NBT file named {@code c.<x>.<z>.dat}
  * (base36 coordinates, signed) inside two levels of base36 folders.
  *
+ * <p>Real chunk files from that era wrap every field in a {@code Level}
+ * compound (root -&gt; Level -&gt; xPos/Blocks/Data/...); files carrying the fields
+ * directly at the root are also accepted, so both shapes convert.
+ *
  * <p>Each chunk is upgraded with the exact same McRegion -&gt; Anvil
  * transformation used for {@code .mcr} payloads (flat 16x16x128 arrays split
  * into 16 sections, entity health normalization) and written directly into
  * fresh Anvil {@code .mca} region files - one pass, no intermediate McRegion
- * files. Only the overworld exists at this point in history; there are no
- * {@code DIM-1}/{@code DIM1} folders to handle.
+ * files. The Nether exists since Alpha 1.2 (Halloween update) and is stored
+ * the same way inside {@code DIM-1}; every {@code DIM*} folder is converted
+ * alongside the overworld.
  */
 final class PreRegionUpgrader {
-        record LegacyChunk(int x, int z, Path file) {
+        record LegacyChunk(int x, int z, Path file, Path dimensionRoot) {
         }
 
         private PreRegionUpgrader() {
@@ -39,8 +44,36 @@ final class PreRegionUpgrader {
 
         static List<LegacyChunk> findChunkFiles(Path worldDir) {
                 List<LegacyChunk> chunks = new ArrayList<>();
-                // Alpha/Infdev layout: world/<b36 x & 63>/<b36 z & 63>/c.<b36 x>.<b36 z>.dat
-                try (var entries = Files.newDirectoryStream(worldDir)) {
+                for (Path dimensionRoot : dimensionRoots(worldDir)) {
+                        chunks.addAll(findChunkFilesIn(dimensionRoot));
+                }
+
+                return chunks;
+        }
+        /**
+         * The overworld chunk root plus every {@code DIM*} folder. The Nether
+         * ({@code DIM-1}) exists since Alpha 1.2, so real Beta 1.2 saves can carry
+         * pre-region chunk files in there too. The returned paths are direct
+         * children of {@code worldDir}.
+         */
+        private static List<Path> dimensionRoots(Path worldDir) {
+                List<Path> roots = new ArrayList<>();
+                roots.add(worldDir);
+                try (Stream<Path> entries = Files.list(worldDir)) {
+                        entries.filter(Files::isDirectory)
+                                .filter(dir -> dir.getFileName().toString().startsWith("DIM"))
+                                .forEach(roots::add);
+                } catch (IOException e) {
+                        LegacyWorldFix.LOGGER.warn("[LegacyWorldFix] Failed to list {} for pre-region dimension folders: {}", worldDir, e.toString());
+                }
+
+                return roots;
+        }
+
+        /** Alpha/Infdev layout inside one dimension: &lt;root&gt;/&lt;b36 x &amp; 63&gt;/&lt;b36 z &amp; 63&gt;/c.&lt;b36 x&gt;.&lt;b36 z&gt;.dat */
+        private static List<LegacyChunk> findChunkFilesIn(Path dimensionRoot) {
+                List<LegacyChunk> chunks = new ArrayList<>();
+                try (var entries = Files.newDirectoryStream(dimensionRoot)) {
                         for (Path folder : entries) {
                                 String folderName = folder.getFileName().toString();
                                 if (!isBase36FolderName(folderName) || !Files.isDirectory(folder)) {
@@ -55,7 +88,7 @@ final class PreRegionUpgrader {
 
                                                 try (DirectoryStream<Path> files = Files.newDirectoryStream(subFolder, "c.*.*.dat")) {
                                                         for (Path file : files) {
-                                                                LegacyChunk chunk = parseChunkFileName(file);
+                                                                LegacyChunk chunk = parseChunkFileName(file, dimensionRoot);
                                                                 if (chunk != null) {
                                                                         chunks.add(chunk);
                                                                 }
@@ -65,7 +98,7 @@ final class PreRegionUpgrader {
                                 }
                         }
                 } catch (IOException e) {
-                        LegacyWorldFix.LOGGER.warn("[LegacyWorldFix] Failed to scan {} for pre-region chunk files: {}", worldDir, e.toString());
+                        LegacyWorldFix.LOGGER.warn("[LegacyWorldFix] Failed to scan {} for pre-region chunk files: {}", dimensionRoot, e.toString());
                 }
 
                 return chunks;
@@ -83,26 +116,26 @@ final class PreRegionUpgrader {
                         return 0L;
                 }
 
-                // Group by target region file: each group becomes one independent task.
+                // Group by target region file (which already encodes its dimension
+                // folder): each group becomes one independent task.
                 Map<Path, List<LegacyChunk>> byRegion = new HashMap<>();
                 for (LegacyChunk chunk : chunks) {
-                        Path regionFile = worldDir.resolve("region")
+                        Path regionFile = chunk.dimensionRoot().resolve("region")
                                 .resolve("r." + (chunk.x() >> 5) + "." + (chunk.z() >> 5) + ".mca");
                         byRegion.computeIfAbsent(regionFile, key -> new ArrayList<>()).add(chunk);
                 }
 
-                Path regionDir = worldDir.resolve("region");
-                Files.createDirectories(regionDir);
-
                 List<Callable<Long>> tasks = new ArrayList<>();
-                for (List<LegacyChunk> group : byRegion.values()) {
-                        tasks.add(() -> convertRegionGroup(worldDir, group));
+                for (Map.Entry<Path, List<LegacyChunk>> entry : byRegion.entrySet()) {
+                        Path regionFile = entry.getKey();
+                        Files.createDirectories(regionFile.getParent());
+                        tasks.add(() -> convertRegionGroup(regionFile, entry.getValue()));
                 }
 
                 return LegacyMcRegionUpgrader.runInParallel(tasks);
         }
 
-        private static long convertRegionGroup(Path worldDir, List<LegacyChunk> group) throws IOException {
+        private static long convertRegionGroup(Path regionFile, List<LegacyChunk> group) throws IOException {
                 RegionIo.AnvilRegionWriter writer = new RegionIo.AnvilRegionWriter();
                 for (LegacyChunk chunk : group) {
                         CompoundTag root;
@@ -120,26 +153,22 @@ final class PreRegionUpgrader {
                         }
                 }
 
-                Path regionFile = worldDir.resolve("region")
-                        .resolve("r." + (group.getFirst().x() >> 5) + "." + (group.getFirst().z() >> 5) + ".mca");
                 writer.saveTo(regionFile);
                 return writer.count();
         }
 
         /**
-         * Wraps an alpha-style chunk NBT (all tags at the root) into the
-         * region-style layout ({@code Level} compound) with the same leniency the
-         * game's own historical converter had, then runs the shared McRegion -&gt;
-         * Anvil transformation.
+         * Normalizes a pre-region chunk NBT into the region-style layout and runs
+         * the shared McRegion -&gt; Anvil transformation.
+         *
+         * <p>Real Infdev/Alpha/Beta 1.2 chunk files wrap everything in a
+         * {@code Level} compound (root -&gt; Level -&gt; xPos/Blocks/...); accepting that
+         * shape is what makes actual 2010/early-2011 saves convert. Files that
+         * carry the fields directly at the root are handled as well.
          */
         static CompoundTag transform(CompoundTag alphaRoot, LegacyChunk chunk) throws IOException {
-                CompoundTag level = new CompoundTag();
-                for (String key : alphaRoot.keySet()) {
-                        Tag value = alphaRoot.get(key);
-                        if (value != null) {
-                                level.put(key, value);
-                        }
-                }
+                CompoundTag wrapped = alphaRoot.getCompoundOrEmpty("Level");
+                CompoundTag level = wrapped.isEmpty() ? alphaRoot : wrapped;
 
                 if (!level.contains("xPos")) {
                         level.putInt("xPos", chunk.x());
@@ -163,6 +192,14 @@ final class PreRegionUpgrader {
                 fillIfMissing(level, "SkyLight", 16384, (byte) 0xFF);
                 if (!level.contains("HeightMap")) {
                         level.putByteArray("HeightMap", computeHeightMap(level));
+                }
+
+                // A chunk whose block array is missing or malformed cannot be converted
+                // honestly; skipping it lets vanilla regenerate that chunk instead of
+                // writing a silent all-air chunk over the map.
+                int blockBytes = level.getByteArray("Blocks").map(array -> array.length).orElse(0);
+                if (blockBytes != 32768) {
+                        throw new IOException("chunk has no valid 32768-byte Blocks array (found " + blockBytes + " bytes)");
                 }
 
                 CompoundTag root = new CompoundTag();
@@ -215,7 +252,7 @@ final class PreRegionUpgrader {
                 }
         }
 
-        private static LegacyChunk parseChunkFileName(Path file) {
+        private static LegacyChunk parseChunkFileName(Path file, Path dimensionRoot) {
                 String name = file.getFileName().toString();
                 // c.<base36 x>.<base36 z>.dat - coordinates may be negative ("-1a").
                 String[] parts = name.substring(2, name.length() - 4).split("\\.");
@@ -226,7 +263,7 @@ final class PreRegionUpgrader {
                 try {
                         int x = Integer.parseInt(parts[0].toLowerCase(java.util.Locale.ROOT), 36);
                         int z = Integer.parseInt(parts[1].toLowerCase(java.util.Locale.ROOT), 36);
-                        return new LegacyChunk(x, z, file);
+                        return new LegacyChunk(x, z, file, dimensionRoot);
                 } catch (NumberFormatException e) {
                         return null;
                 }
