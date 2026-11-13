@@ -1,0 +1,33 @@
+=== PREUVE E2E - LegacyWorldFix 1.0.0 sur serveur Fabric 26.3 ===
+
+--- Test 1 : monde McRegion 1.0 (format 2011, level.dat version=19132) ---
+[m[LegacyWorldFix] Loaded - worlds saved before 1.6.4 (McRegion / early Anvil) can be upgraded again
+[m[LegacyWorldFix] McRegion world detected (level.dat version 19132): /home/z/my-project/testserver/legacytest
+[m[LegacyWorldFix] Converted 1 region file(s) / 4 chunk(s) from McRegion to Anvil in 60 ms - vanilla upgrade chain can take over now
+[m[LegacyWorldFix] Converted 1 McRegion world(s) in /home/z/my-project/testserver before server start
+[mStarting upgrade for world "legacytest"
+[mUpgrade done for world "legacytest"
+[Server thread/INFO]: Done (0.386s)! For help, type "help"
+
+--- Resultat apres conversion + upgrade vanilla ---
+level.dat: version=19133 DataVersion=5023 Version={'Series': 'main', 'Id': 5023, 'Name': '26.3'}
+  DataVersion=5023 Status=? sections=0 blocks=[]
+  entity: id=minecraft:pig Health=10.0 UUID=True
+  DataVersion=5023 Status=minecraft:full sections=24 blocks=[]
+  block_entity: minecraft:chest at 5 5 5 (coffre 1.0 migre)
+
+--- Test 2 : vrai monde genere par le serveur officiel 1.2.5 (2012) ---
+[m[LegacyWorldFix] Loaded - worlds saved before 1.6.4 (McRegion / early Anvil) can be upgraded again
+[mStarting upgrade for world "real125"
+[mUpgrade done for world "real125"
+[Server thread/INFO]: Done (0.383s)! For help, type "help"
+
+--- Test 3 : chemin client (conversion via mixin makeLevelSummary, monde hors scan init) ---
+[m[LegacyWorldFix] Loaded - worlds saved before 1.6.4 (McRegion / early Anvil) can be upgraded again
+[m[LegacyWorldFix] McRegion world detected (level.dat version 19132): saves/legacytest
+[m[LegacyWorldFix] Converted 1 region file(s) / 4 chunk(s) from McRegion to Anvil in 24 ms - vanilla upgrade chain can take over now
+[mStarting upgrade for world "legacytest"
+[mUpgrade done for world "legacytest"
+[Server thread/INFO]: Done (0.402s)! For help, type "help"
+
+Aucun message 'This world must be opened in an older version (like 1.6.4)' dans les 3 tests.
