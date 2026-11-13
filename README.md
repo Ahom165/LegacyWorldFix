@@ -25,14 +25,32 @@ d'époque exact — enveloppe `Level`, noms base36 signés (`1f/18/c.-d.18.dat`)
 sans tag `version` : terrain, coffres (contenu inclus), cochons vivants, chunks négatifs
 et Nether arrivent tous intacts en 26.3 (voir `docs/PREUVE-TESTS-1.1.1.txt`).
 
+**Nouveau dans la 1.3.0** : la conversion devient **par chunk** et l'upgrade vanilla
+**disparaît complètement** :
+
+- le travail lourd (lecture gzip + transformation + chaîne DataFixerUpper + zlib) tourne
+  **une tâche par chunk** dans le pool (un monde Alpha dense ne touche que quelques fichiers
+  de région : l'ancienne granularité « par région » laissait les cœurs inactifs — sur un
+  monde réel de 1 195 chunks, la conversion passe de ~21 s à ~4-6 s selon la machine) ;
+- `level.dat` est remonté **en place** par la chaîne LEVEL vanilla et reçoit le tag
+  `DataVersion` courant (5023) + le tag `Version` — le passage « Starting upgrade for
+  world » de vanilla **ne démarre plus du tout** (plus de copie avec hardlinks, plus de
+  rescan des régions) ;
+- le mod recrée ce que le « file fixing » vanilla faisait pendant ce passage :
+  `data/minecraft/world_gen_settings.dat` (seed + générateurs standard des trois
+  dimensions, surplat si le LevelType l'exige) et `players/data/<uuid>.dat` (joueur de
+  level.dat remonté par la chaîne PLAYER — l'inventaire y reçoit ses ids `minecraft:*` —
+  position conservée, UUID rétrogradé à l'UUID zéro vanilla si absent) ;
+- en cas d'échec imprévu de la remontée de `level.dat`, rien n'est extrait et vanilla
+  reprend la main avec son propre passage (résultat identique, plus lent).
+
 **Nouveau dans la 1.2.0** : conversion **et** remontée de données en une seule passe
 parallèle. Le mod applique désormais lui-même la chaîne DataFixerUpper vanilla (le même
 appel que l'« upgrade » du jeu, tag `__context` dimension/générateur compris) et écrit les
 chunks directement à la version de données courante (5023) :
 
-- l'upgrade vanilla qui suivait la conversion (« Starting upgrade… 0 % → 100 % ») devient
-  un passage quasi instantané — sur le monde de test : **23 s → ~1 s**, et la préparation
-  du spawn passe de ~11 s à quelques millisecondes ;
+- l'upgrade vanilla qui suivait la conversion (« Starting upgrade… 0 % → 100 % ») était
+  réduit à un passage quasi instantané ; depuis la 1.3.0 il n'a simplement **plus lieu** ;
 - les données d'époque sont fixes dans le même passage : un spawner Beta 1.2
   (`EntityId: "Pig"`) arrive en spawner moderne (`SpawnData.entity.id:
   "minecraft:pig"`, délais et portée recalculés) ;
@@ -95,25 +113,25 @@ McRegion → Anvil. C'est exactement ce que ce mod recrée.
    - serveur dédié : scan du dossier courant au démarrage (avant toute lecture du monde),
      en plus de la même greffe de sécurité (le serveur dédié 26.3 passe aussi par
      `makeLevelSummary` au chargement du monde).
-5. **Optimisations** (1.1.0, étendues en 1.2.0) : conversion des fichiers de région
-   **parallélisée** (jusqu'à 8 threads, tâche = 1 fichier de région), lecture du header de
-   région en une seule fois au lieu de 2048 `seek`, compression zlib en `BEST_SPEED`, et
-   depuis la 1.2.0 la **remontée DataFixerUpper est faite dans le même pool de threads**
-   (le DFU vanilla est thread-safe : c'est exactement ce que fait le chargement de chunks
-   normal). Le goulot d'étranglement restant (upgrade vanilla séquentiel) est éliminé :
-   voir la section 1.2.0 ci-dessus.
-6. Ensuite, **la 26.3 fait le reste toute seule** : file fixing, puis remontée des données
-   (blocs renommés en `minecraft:*`, entités avec UUID, entités déplacées dans `entities/`,
-   statuts de chunks, etc.).
+5. **Optimisations** (1.1.0 → 1.3.0) : lecture du header de région en une seule fois au
+   lieu de 2048 `seek`, compression zlib en `BEST_SPEED`, et surtout une granularité
+   **par chunk** : la remontée DataFixerUpper (coûteuse, thread-safe) tourne dans un pool
+   d'un fil par cœur logique (max 16), une tâche par chunk — la densité d'un monde Alpha
+   ne bride plus le parallélisme.
+6. Ensuite, **la 26.3 fait le reste toute seule** — et depuis la 1.3.0, il ne lui reste
+   presque rien à faire : les chunks comme `level.dat` sont déjà à la version de données
+   courante, `world_gen_settings.dat` et `players/data/` existent, le jeu ouvre le monde
+   directement (aucun « Starting upgrade for world » dans les logs).
 
 Vérifié de bout en bout sur serveur 26.3 (voir `docs/PREUVE-TESTS.txt` pour la 1.1.0,
-`docs/PREUVE-TESTS-1.1.1.txt` pour le correctif Beta 1.2 et
-`docs/PREUVE-TESTS-1.2.0.txt` pour la 1.2.0) : mondes McRegion 1.0, Beta 1.2
-réel (format d'époque exact) et Indev arrivent tous en `DataVersion 5023`
+`docs/PREUVE-TESTS-1.1.1.txt` pour le correctif Beta 1.2, `docs/PREUVE-TESTS-1.2.0.txt`
+pour la 1.2.0 et `docs/PREUVE-TESTS-1.3.0.txt` pour la 1.3.0) : mondes McRegion 1.0,
+Beta 1.2 réel (format d'époque exact) et Indev arrivent tous en `DataVersion 5023`
 (`Version {Name: "26.3"}`), avec les blocs en palette moderne (`minecraft:grass_block`,
-`minecraft:gold_block`, `minecraft:water`...), les entités de l'époque vivantes
-(`Health: 10.0`, UUID ajouté, IA active — le cochon se déplace), les coffres intacts et
-les spawners d'époque fonctionnels (`SpawnData.entity.id: "minecraft:pig"`).
+`minecraft:gold_block`...), les entités de l'époque vivantes (`Health: 10.0`, UUID ajouté,
+IA active), les coffres intacts et les spawners d'époque fonctionnels
+(`SpawnData.entity.id: "minecraft:pig"`). Le serveur démarre sans aucun passage d'upgrade
+vanilla et `world_gen_settings.dat`/`players/data/` sont créés avec le seed d'origine.
 Un monde hors de portée du scan serveur (monde imbriqué) est converti par la greffe
 `makeLevelSummary` : le chemin client est donc couvert aussi.
 
@@ -124,30 +142,29 @@ du chemin « schéma 99 », le monde est jouable tel quel.
 ## Installation
 
 1. Installe Fabric Loader 0.20.1 ou plus récent pour Minecraft 26.3.
-2. Dépose `legacyworldfix-1.2.0+mc26.3.jar` dans le dossier `mods/`.
+2. Dépose `legacyworldfix-1.3.0+mc26.3.jar` dans le dossier `mods/`.
 3. Lance le jeu (client) ou le serveur. Aucune configuration.
 
 ### Utilisation (client)
 
-Ouvre la liste des mondes : le monde 1.0 apparaît normalement (le mod le convertit en
-McRegion → Anvil à ce moment, regarde les logs). Clique dessus : le jeu propose
-« Mettre à jour et jouer » — c'est le flux officiel de mise à niveau, laisse-le finir.
-Le monde est ensuite en 26.3.
+Ouvre la liste des mondes : le monde apparaît normalement (le mod le convertit en Anvil
+avec toutes ses données à ce moment, regarde les logs). Clique dessus : le monde charge
+directement — plus de flux « Mettre à jour et jouer », plus d'attente.
 
 ### Utilisation (serveur dédié)
 
 Démarre simplement le serveur : les mondes McRegion, Infdev/Alpha et Indev du dossier sont
-convertis avant le chargement, puis la mise à niveau officielle s'exécute (messages
-`Starting upgrade for world ...` / `Upgrade done`).
+convertis avant le chargement, données comprises — aucun message `Starting upgrade for
+world`, le monde est prêt dès le `Done`.
 
 ## Limites connues (honnêtes)
 
 - **Minecraft Classic pré-Indev (c0.0.x)** : les niveaux dont `Blocks` est un tableau
   d'`int` sont gérés en mode best-effort, mais le launcher et la structure des sauvegardes
   de cette époque (fichiers `.mclevel` hors dossier `saves/`) n'ont jamais été testés.
-- **Spawners de donjons des mondes pré-1.9** : au premier chargement d'un chunk, vanilla
-  peut noter `Failed to fetch mob spawner entity ...` et réinitialiser le spawner. C'est un
-  comportement vanilla de la remontée de données, indépendant de ce mod.
+- **Fichiers joueurs anciens (`players/<pseudo>.dat`, ère multi Bêta)** : seuls le joueur
+  de `level.dat` (mono) et les joueurs avec UUID sont replacés dans `players/data/` ; les
+  fichiers de l'ère Bêta sans UUID réapparaissent en spawn.
 - **Éclairage des mondes Indev** : la lumière du ciel est approximée à la conversion puis
   recalculée par le moteur de lumière moderne au chargement.
 - Les mondes Anvil sans `DataVersion` (1.2 → 1.8) n'ont même pas besoin du mod : la 26.3

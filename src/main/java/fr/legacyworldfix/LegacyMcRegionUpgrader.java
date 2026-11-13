@@ -6,6 +6,8 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.Callable;
@@ -61,7 +63,8 @@ public final class LegacyMcRegionUpgrader {
         public static final int MCREGION_STORAGE_VERSION = 19132;
         public static final int ANVIL_STORAGE_VERSION = 19133;
 
-        private static final int PARALLELISM = Math.max(1, Math.min(8, Runtime.getRuntime().availableProcessors()));
+        /** One worker per logical core (bounded for safety), keeping one core for the game thread. */
+        private static final int PARALLELISM = Math.max(2, Math.min(16, Runtime.getRuntime().availableProcessors() - 1));
 
         /** Storage shapes this mod knows how to handle. */
         public enum LegacyFormat {
@@ -228,7 +231,7 @@ public final class LegacyMcRegionUpgrader {
          * and generator go into the {@code __context} tag consumed by the 1.18
          * blending/height fixes, and the upgraded tag is stamped with the current
          * data version. The DFU is thread-safe, so this runs inside the parallel
-         * conversion pool - the vanilla upgrade pass afterwards becomes a fast no-op.
+         * conversion pool - with every chunk stamped, the vanilla upgrade pass is skipped entirely.
          *
          * <p>If the upgrade unexpectedly fails, the chunk is returned unchanged
          * (no DataVersion), and vanilla's own upgrader still converts it later:
@@ -271,6 +274,11 @@ public final class LegacyMcRegionUpgrader {
                 return applyVanillaDataFixes(transformChunkNbt(oldRoot), dimensionId, generatorId);
         }
 
+        /** Worker pool size shared by every converter. */
+        static int parallelism() {
+                return PARALLELISM;
+        }
+
         /** Original case: McRegion (.mcr) containers, level.dat version 19132. */
         private static boolean convertMcRegionWorld(Path worldDir, String generatorId) {
                 long start = System.nanoTime();
@@ -292,35 +300,74 @@ public final class LegacyMcRegionUpgrader {
                                 }
                         }
 
-                        List<Callable<Long>> tasks = pairs.stream().<Callable<Long>>map(pair -> () -> {
-                                // pair = {mcr, mca, dimensionRoot}: each region file belongs to
-                                // exactly one dimension, which the DFU context tag needs.
+                        // Phase 1 (I/O bound, sequential): copy the raw compressed chunk
+                        // payloads out of every .mcr container. No decode happens here.
+                        Map<Path, List<RegionIo.RawChunk>> rawChunksBySource = new LinkedHashMap<>();
+                        for (Path[] pair : pairs) {
+                                rawChunksBySource.put(pair[0], RegionIo.readRawChunks(pair[0]));
+                        }
+
+                        // Phase 2 (CPU bound, parallel): decode + McRegion -> Anvil shape
+                        // + vanilla datafixers + zlib, one task per chunk. Per-chunk
+                        // granularity is what keeps every core busy even when the world
+                        // spreads over only a handful of region files.
+                        List<Callable<RegionIo.CompressedChunk>> tasks = new ArrayList<>();
+                        for (Path[] pair : pairs) {
+                                List<RegionIo.RawChunk> group = rawChunksBySource.get(pair[0]);
+                                if (group == null) {
+                                        continue;
+                                }
+
                                 String dimensionId = dimensionIdFor(pair[2]);
-                                long chunks = RegionIo.convertMcRegionToAnvil(
-                                        pair[0],
-                                        pair[1],
-                                        tag -> transformAndUpgradeChunk(tag, dimensionId, generatorId)
-                                );
+                                for (RegionIo.RawChunk raw : group) {
+                                        tasks.add(() -> {
+                                                try {
+                                                        CompoundTag chunk = RegionIo.decodeChunk(raw);
+                                                        return RegionIo.compressChunk(pair[0], raw, transformAndUpgradeChunk(chunk, dimensionId, generatorId));
+                                                } catch (Exception e) {
+                                                        LegacyWorldFix.LOGGER.error("[LegacyWorldFix] Skipping unreadable chunk in {} (slot {}): {}", pair[0], raw.slot(), e.toString());
+                                                        return null;
+                                                }
+                                        });
+                                }
+                        }
+                        List<RegionIo.CompressedChunk> converted = runInParallelCollect(tasks);
+
+                        // Phase 3 (I/O bound, sequential): assemble and save each Anvil
+                        // region file, then drop the .mcr it came from.
+                        Map<Path, List<RegionIo.CompressedChunk>> bySource = new HashMap<>();
+                        for (RegionIo.CompressedChunk chunk : converted) {
+                                if (chunk != null) {
+                                        bySource.computeIfAbsent(chunk.source(), key -> new ArrayList<>()).add(chunk);
+                                }
+                        }
+
+                        long chunks = 0L;
+                        for (Path[] pair : pairs) {
+                                RegionIo.AnvilRegionWriter writer = new RegionIo.AnvilRegionWriter();
+                                for (RegionIo.CompressedChunk chunk : bySource.getOrDefault(pair[0], List.of())) {
+                                        writer.writeCompressedChunk(chunk.slot(), chunk.timestamp(), chunk.payload());
+                                }
+                                writer.saveTo(pair[1]);
+                                chunks += writer.count();
                                 Files.delete(pair[0]);
-                                return chunks;
-                        }).toList();
-                        long chunks = runInParallel(tasks);
+                        }
 
                         int regions = pairs.size();
 
                         // level.dat is rewritten last: if anything above failed, the world is
                         // still an honest McRegion world and the vanilla refusal stays in place.
-                        patchLevelDat(worldDir.resolve("level.dat"), worldDir.getFileName().toString());
+                        patchLevelDat(worldDir, worldDir.resolve("level.dat"), worldDir.getFileName().toString(), true);
                         Path levelDatOld = worldDir.resolve("level.dat_old");
                         if (Files.isRegularFile(levelDatOld)) {
-                                patchLevelDat(levelDatOld, worldDir.getFileName().toString());
+                                patchLevelDat(worldDir, levelDatOld, worldDir.getFileName().toString(), false);
                         }
 
                         writeMarker(worldDir, "converted-from-mcregion.txt",
                                 "Converted from McRegion (version 19132) to Anvil (version 19133) by LegacyWorldFix",
                                 regions, chunks);
                         LegacyWorldFix.LOGGER.info(
-                                "[LegacyWorldFix] Converted {} region file(s) / {} chunk(s) from McRegion to Anvil in {} ms (data fixes applied in place) - vanilla upgrade pass is now a no-op",
+                                "[LegacyWorldFix] Converted {} region file(s) / {} chunk(s) from McRegion to Anvil in {} ms (data fixes applied in place) - the vanilla upgrade pass is skipped",
                                 regions,
                                 chunks,
                                 (System.nanoTime() - start) / 1_000_000L
@@ -344,17 +391,17 @@ public final class LegacyMcRegionUpgrader {
                 try {
                         long chunks = PreRegionUpgrader.convertToAnvil(worldDir, generatorId);
 
-                        patchLevelDat(worldDir.resolve("level.dat"), worldDir.getFileName().toString());
+                        patchLevelDat(worldDir, worldDir.resolve("level.dat"), worldDir.getFileName().toString(), true);
                         Path levelDatOld = worldDir.resolve("level.dat_old");
                         if (Files.isRegularFile(levelDatOld)) {
-                                patchLevelDat(levelDatOld, worldDir.getFileName().toString());
+                                patchLevelDat(worldDir, levelDatOld, worldDir.getFileName().toString(), false);
                         }
 
                         writeMarker(worldDir, "converted-from-alpha.txt",
                                 "Converted from pre-region Infdev/Alpha chunk files to Anvil (version 19133) by LegacyWorldFix",
                                 0, chunks);
                         LegacyWorldFix.LOGGER.info(
-                                "[LegacyWorldFix] Converted {} pre-region chunk(s) to Anvil in {} ms (data fixes applied in place) - vanilla upgrade pass is now a no-op",
+                                "[LegacyWorldFix] Converted {} pre-region chunk(s) to Anvil in {} ms (data fixes applied in place) - the vanilla upgrade pass is skipped",
                                 chunks,
                                 (System.nanoTime() - start) / 1_000_000L
                         );
@@ -390,27 +437,40 @@ public final class LegacyMcRegionUpgrader {
         }
 
         /**
-         * Runs independent conversion tasks with a small worker pool. Region files
-         * are the unit of work: they never share state, so parallelism is safe and
-         * scales with cores on big worlds (the historical code was strictly
-         * sequential).
+         * Runs independent conversion tasks with a small worker pool and sums
+         * their chunk counts.
          */
         static long runInParallel(List<Callable<Long>> tasks) throws IOException {
+                long total = 0L;
+                for (Long result : runInParallelCollect(tasks)) {
+                        total += result;
+                }
+
+                return total;
+        }
+
+        /**
+         * Runs independent conversion tasks with a worker pool and collects every
+         * non-null result. The chunk (or its decoded payload) is the unit of work:
+         * tasks never share mutable state, so parallelism is safe and scales with
+         * cores (the historical code was strictly sequential).
+         */
+        static <T> List<T> runInParallelCollect(List<Callable<T>> tasks) throws IOException {
                 if (tasks.isEmpty()) {
-                        return 0L;
+                        return List.of();
                 }
                 if (tasks.size() == 1 || PARALLELISM == 1) {
-                        long total = 0L;
-                        for (Callable<Long> task : tasks) {
-                                try {
-                                        total += task.call();
-                                } catch (IOException e) {
-                                        throw e;
-                                } catch (Exception e) {
-                                        throw new IOException(e);
+                        try {
+                                List<T> results = new ArrayList<>(tasks.size());
+                                for (Callable<T> task : tasks) {
+                                        results.add(task.call());
                                 }
+                                return results;
+                        } catch (IOException e) {
+                                throw e;
+                        } catch (Exception e) {
+                                throw new IOException(e);
                         }
-                        return total;
                 }
 
                 ExecutorService pool = Executors.newFixedThreadPool(PARALLELISM, runnable -> {
@@ -419,20 +479,20 @@ public final class LegacyMcRegionUpgrader {
                         return thread;
                 });
                 try {
-                        long total = 0L;
                         try {
-                                for (Future<Long> future : pool.invokeAll(tasks)) {
+                                List<T> results = new ArrayList<>(tasks.size());
+                                for (Future<T> future : pool.invokeAll(tasks)) {
                                         try {
-                                                total += future.get();
+                                                results.add(future.get());
                                         } catch (ExecutionException e) {
                                                 throw e.getCause() instanceof IOException io ? io : new IOException(e.getCause());
                                         }
                                 }
+                                return results;
                         } catch (InterruptedException e) {
                                 Thread.currentThread().interrupt();
                                 throw new IOException("Interrupted during conversion", e);
                         }
-                        return total;
                 } finally {
                         pool.shutdown();
                 }
@@ -552,10 +612,65 @@ public final class LegacyMcRegionUpgrader {
                 }
         }
 
-        private static void patchLevelDat(Path levelDat, String defaultLevelName) throws IOException {
+        /**
+         * Rewrites level.dat the way the vanilla 26.x "file fixing" pass would:
+         * the storage version goes to Anvil, the whole LEVEL datafixer chain runs
+         * in place, the current DataVersion is stamped, and the state the current
+         * version expects in separate saved-data files ({@code world_gen_settings.dat},
+         * {@code players/data/<uuid>.dat}) is extracted there. With the DataVersion
+         * stamp vanilla skips its entire upgrade flow on load ("Starting upgrade
+         * for world" never appears): no filefix copy with hardlinks, no region
+         * rescan - the world opens right away.
+         *
+         * <p>If the LEVEL upgrade unexpectedly fails, nothing is extracted and
+         * level.dat keeps no DataVersion, so vanilla runs its own (slow but
+         * identical) pass later.
+         */
+        private static void patchLevelDat(Path worldDir, Path levelDat, String defaultLevelName, boolean writeSavedDataFiles) throws IOException {
                 CompoundTag root = NbtIo.readCompressed(levelDat, NbtAccounter.unlimitedHeap());
                 CompoundTag data = root.getCompoundOrEmpty("Data");
                 data.putInt("version", ANVIL_STORAGE_VERSION);
+
+                // Capture the legacy generator fields before the DFU folds them into
+                // world_gen_settings - the flat check decides the overworld generator.
+                String legacyLevelType = data.getStringOr("LevelType", "");
+                long legacySeed = data.getLongOr("RandomSeed", 0L);
+                boolean legacyMapFeatures = data.getBooleanOr("MapFeatures", true);
+
+                int currentVersion = SharedConstants.getCurrentVersion().dataVersion().version();
+                int dataVersion = data.getIntOr("DataVersion", -1);
+                boolean levelFixed = true;
+                if (dataVersion < currentVersion) {
+                        try {
+                                CompoundTag upgraded = DataFixTypes.LEVEL.update(DataFixers.getDataFixer(), data, dataVersion, currentVersion);
+                                root.put("Data", upgraded);
+                                data = upgraded;
+                        } catch (RuntimeException e) {
+                                LegacyWorldFix.LOGGER.warn(
+                                        "[LegacyWorldFix] Could not upgrade {} in place ({}); the vanilla upgrade pass will handle level.dat instead",
+                                        levelDat,
+                                        e.toString()
+                                );
+                                levelFixed = false;
+                        }
+                }
+
+                if (levelFixed) {
+                        if (writeSavedDataFiles) {
+                                writeWorldGenSettings(worldDir, data, legacyLevelType, legacySeed, legacyMapFeatures, currentVersion);
+                                movePlayerToPlayerData(worldDir, data, currentVersion);
+                        }
+                        NbtUtils.addDataVersion(data, currentVersion);
+                        // Same "Version" tag vanilla's addVersionsToLevelData writes, so
+                        // the world list shows the world as a current-version world.
+                        var worldVersion = SharedConstants.getCurrentVersion();
+                        CompoundTag versionTag = new CompoundTag();
+                        versionTag.putString("Name", worldVersion.name());
+                        versionTag.putInt("Id", currentVersion);
+                        versionTag.putBoolean("Snapshot", !worldVersion.stable());
+                        versionTag.putString("Series", worldVersion.dataVersion().series());
+                        data.put("Version", versionTag);
+                }
 
                 // Pre-Beta 1.8 saves have no LevelName; the world list needs one.
                 if (data.getStringOr("LevelName", "").isEmpty()) {
@@ -570,6 +685,131 @@ public final class LegacyMcRegionUpgrader {
                 }
 
                 NbtIo.writeCompressed(root, levelDat);
+        }
+
+        /**
+         * Replicates the worldgen part of the vanilla {@code LevelDatToSavedDataFileFix}:
+         * since 1.21.5 the world seed and dimension generators live in
+         * {@code data/minecraft/world_gen_settings.dat}, not in level.dat, and the
+         * game refuses to load a world without that file ("Overworld settings
+         * missing"). The DFU leaves only {@code {RandomSeed}} behind in level.dat,
+         * so we build the full structure: the legacy seed plus the three standard
+         * dimensions, with a flat overworld generator when the legacy LevelType
+         * says the world was superflat. The key is then removed from level.dat,
+         * exactly like the file fix does.
+         */
+        private static void writeWorldGenSettings(Path worldDir, CompoundTag data, String legacyLevelType, long legacySeed, boolean legacyMapFeatures, int currentVersion) throws IOException {
+                CompoundTag worldGenSettings = new CompoundTag();
+                worldGenSettings.putBoolean("bonus_chest", false);
+                long seed = data.getCompoundOrEmpty("world_gen_settings").getLongOr("RandomSeed", legacySeed);
+                worldGenSettings.putLong("seed", seed);
+                worldGenSettings.putBoolean("generate_structures", legacyMapFeatures);
+
+                CompoundTag dimensions = new CompoundTag();
+                dimensions.put("minecraft:the_nether", noiseDimension("minecraft:the_nether", "nether", false));
+                dimensions.put("minecraft:the_end", noiseDimension("minecraft:the_end", "end", true));
+                if (legacyLevelType.toLowerCase(java.util.Locale.ROOT).contains("flat")) {
+                        dimensions.put("minecraft:overworld", flatOverworldDimension());
+                } else {
+                        dimensions.put("minecraft:overworld", noiseDimension("minecraft:overworld", "overworld", false));
+                }
+                worldGenSettings.put("dimensions", dimensions);
+
+                CompoundTag file = new CompoundTag();
+                file.put("data", worldGenSettings);
+                NbtUtils.addDataVersion(file, currentVersion);
+
+                Path target = worldDir.resolve("data").resolve("minecraft").resolve("world_gen_settings.dat");
+                Files.createDirectories(target.getParent());
+                NbtIo.writeCompressed(file, target);
+                data.remove("world_gen_settings");
+        }
+
+        /** Standard noise-based dimension generator, as written by the vanilla file fix. */
+        private static CompoundTag noiseDimension(String dimensionType, String settingsName, boolean endBiomeSource) {
+                CompoundTag biomeSource = new CompoundTag();
+                biomeSource.putString("type", endBiomeSource ? "minecraft:the_end" : "minecraft:multi_noise");
+                if (!endBiomeSource) {
+                        biomeSource.putString("preset", "minecraft:" + settingsName);
+                }
+
+                CompoundTag generator = new CompoundTag();
+                generator.putString("type", "minecraft:noise");
+                generator.putString("settings", "minecraft:" + settingsName);
+                generator.put("biome_source", biomeSource);
+
+                CompoundTag dimension = new CompoundTag();
+                dimension.putString("type", dimensionType);
+                dimension.put("generator", generator);
+                return dimension;
+        }
+
+        /** Superflat overworld generator for legacy worlds whose LevelType says "flat". */
+        private static CompoundTag flatOverworldDimension() {
+                ListTag layers = new ListTag();
+                String[] blockIds = {"minecraft:bedrock", "minecraft:dirt", "minecraft:grass_block"};
+                int[] heights = {1, 2, 1};
+                for (int i = 0; i < blockIds.length; i++) {
+                        CompoundTag layer = new CompoundTag();
+                        layer.putString("block", blockIds[i]);
+                        layer.putInt("height", heights[i]);
+                        layers.add(layers.size(), layer);
+                }
+
+                CompoundTag settings = new CompoundTag();
+                settings.put("layers", layers);
+                settings.putString("biome", "minecraft:plains");
+                settings.putBoolean("features", false);
+                settings.putBoolean("lakes", false);
+
+                CompoundTag generator = new CompoundTag();
+                generator.putString("type", "minecraft:flat");
+                generator.put("settings", settings);
+
+                CompoundTag dimension = new CompoundTag();
+                dimension.putString("type", "minecraft:overworld");
+                dimension.put("generator", generator);
+                return dimension;
+        }
+
+        /**
+         * Replicates the player part of the vanilla file fix: the level.dat player
+         * moves to {@code players/data/<uuid>.dat} with the PLAYER datafixer chain
+         * applied (that is where item ids get their namespaces), and level.dat
+         * records the UUID under {@code singleplayer_uuid}. Players without a UUID
+         * (every pre-1.8 save) get the vanilla fallback all-zero UUID.
+         */
+        private static void movePlayerToPlayerData(Path worldDir, CompoundTag data, int currentVersion) throws IOException {
+                CompoundTag player = data.getCompoundOrEmpty("Player");
+                if (player.isEmpty()) {
+                        return;
+                }
+
+                CompoundTag upgraded;
+                try {
+                        int playerVersion = NbtUtils.getDataVersion(player, -1);
+                        upgraded = DataFixTypes.PLAYER.update(DataFixers.getDataFixer(), player, playerVersion, currentVersion);
+                } catch (RuntimeException e) {
+                        LegacyWorldFix.LOGGER.warn(
+                                "[LegacyWorldFix] Could not upgrade the level.dat player in place ({}); it stays in level.dat",
+                                e.toString()
+                        );
+                        return;
+                }
+
+                java.util.UUID uuid = new java.util.UUID(0L, 0L);
+                int[] rawUuid = upgraded.getIntArray("UUID").orElse(null);
+                if (rawUuid != null && rawUuid.length == 4) {
+                        uuid = net.minecraft.core.UUIDUtil.uuidFromIntArray(rawUuid);
+                }
+
+                Path playerFile = worldDir.resolve("players").resolve("data").resolve(uuid + ".dat");
+                Files.createDirectories(playerFile.getParent());
+                NbtUtils.addDataVersion(upgraded, currentVersion);
+                NbtIo.writeCompressed(upgraded, playerFile);
+
+                data.remove("Player");
+                data.putIntArray("singleplayer_uuid", net.minecraft.core.UUIDUtil.uuidToIntArray(uuid));
         }
 
         /**

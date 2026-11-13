@@ -12,6 +12,8 @@ import java.io.RandomAccessFile;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.zip.Deflater;
 import java.util.zip.DeflaterOutputStream;
 import java.util.zip.GZIPInputStream;
@@ -28,10 +30,17 @@ import net.minecraft.nbt.NbtIo;
  * files; we always write zlib like modern versions do.
  */
 final class RegionIo {
-        /** Transforms one chunk NBT (may throw IOException). */
-        @FunctionalInterface
-        interface ChunkTransformer {
-                CompoundTag transform(CompoundTag chunk) throws IOException;
+
+        /**
+         * A chunk payload copied out of a region container, still compressed.
+         * Decoding it (inflate + NBT parse + datafixers) is the expensive part of
+         * a conversion and is done later, in parallel, one chunk at a time.
+         */
+        record RawChunk(int slot, int timestamp, byte[] data, int compressionType) {
+        }
+
+        /** A fully transformed chunk, ready to be written into an Anvil container. */
+        record CompressedChunk(Path source, int slot, int timestamp, byte[] payload) {
         }
 
         private static final int SECTOR_BYTES = 4096;
@@ -56,7 +65,15 @@ final class RegionIo {
                 private int written;
 
                 void writeChunk(int slot, int timestamp, CompoundTag nbt) throws IOException {
-                        byte[] compressed = zlibNbt(nbt);
+                        writeCompressedChunk(slot, timestamp, zlibNbt(nbt));
+                }
+
+                /**
+                 * Appends an already zlib-compressed chunk. Lets parallel workers do
+                 * the compression outside the lock when several threads feed the same
+                 * in-memory region.
+                 */
+                void writeCompressedChunk(int slot, int timestamp, byte[] compressed) throws IOException {
                         int total = compressed.length + 5;
                         int sectorCount = (total + SECTOR_BYTES - 1) / SECTOR_BYTES;
                         if (sectorCount > 255) {
@@ -92,6 +109,7 @@ final class RegionIo {
                         this.payload.writeTo(out);
 
                         Path temp = target.resolveSibling(target.getFileName() + ".legacyworldfix.tmp");
+                        Files.createDirectories(target.getParent());
                         Files.write(temp, out.toByteArray());
                         Files.move(temp, target, StandardCopyOption.REPLACE_EXISTING);
                         return true;
@@ -99,36 +117,50 @@ final class RegionIo {
         }
 
         /**
-         * Reads every chunk of the McRegion file, pipes it through the transformer
-         * and writes the result as an Anvil region file. Chunks that cannot be read
-         * (empty slot, corrupt payload) are skipped so one bad chunk does not sink
-         * the whole world conversion.
+         * Copies every stored chunk payload of the McRegion file out of the
+         * container without decoding it. This pass is pure I/O and keeps the file
+         * access single-threaded (the region reader is not thread-safe); the
+         * expensive decode/transform/DFU work then runs on parallel per-chunk
+         * tasks via {@link #decodeChunk} + {@link #compressChunk}.
          *
-         * @return the number of chunks written
+         * <p>Chunks that cannot be read (empty slot, corrupt payload) are skipped
+         * so one bad chunk does not sink the whole world conversion.
          */
-        static int convertMcRegionToAnvil(Path source, Path target, ChunkTransformer chunkTransformer) throws IOException {
-                AnvilRegionWriter writer = new AnvilRegionWriter();
-
+        static List<RawChunk> readRawChunks(Path source) throws IOException {
+                List<RawChunk> rawChunks = new ArrayList<>();
                 try (RegionReader reader = new RegionReader(source)) {
                         for (int slot = 0; slot < 1024; slot++) {
-                                CompoundTag chunk;
                                 try {
-                                        chunk = reader.readChunk(slot);
+                                        RawChunk raw = reader.readRawChunk(slot);
+                                        if (raw != null) {
+                                                rawChunks.add(raw);
+                                        }
                                 } catch (Exception e) {
                                         LegacyWorldFix.LOGGER.error("[LegacyWorldFix] Skipping unreadable chunk in {} (slot {}): {}", source, slot, e.toString());
-                                        continue;
                                 }
-
-                                if (chunk == null) {
-                                        continue;
-                                }
-
-                                writer.writeChunk(slot, reader.chunkTimestamp(slot), chunkTransformer.transform(chunk));
                         }
                 }
 
-                writer.saveTo(target);
-                return writer.count();
+                return rawChunks;
+        }
+
+        /** Inflates and parses one raw chunk payload. */
+        static CompoundTag decodeChunk(RawChunk raw) throws IOException {
+                InputStream stream = switch (raw.compressionType()) {
+                        case COMPRESSION_GZIP -> new GZIPInputStream(new ByteArrayInputStream(raw.data()));
+                        case COMPRESSION_ZLIB -> new InflaterInputStream(new ByteArrayInputStream(raw.data()));
+                        case COMPRESSION_NONE -> new ByteArrayInputStream(raw.data());
+                        default -> throw new IOException("Unknown chunk compression " + raw.compressionType());
+                };
+
+                try (InputStream in = new BufferedInputStream(stream)) {
+                        return NbtIo.read(new DataInputStream(in), NbtAccounter.unlimitedHeap());
+                }
+        }
+
+        /** Compresses a transformed chunk into its final Anvil payload. */
+        static CompressedChunk compressChunk(Path source, RawChunk raw, CompoundTag transformed) throws IOException {
+                return new CompressedChunk(source, raw.slot(), raw.timestamp(), zlibNbt(transformed));
         }
 
         /** Reads a loose, gzipped NBT file (pre-region chunk files and old level.dat variants). */
@@ -188,7 +220,7 @@ final class RegionIo {
                         return readInt(this.header, 4096 + slot * 4);
                 }
 
-                CompoundTag readChunk(int slot) throws IOException {
+                RawChunk readRawChunk(int slot) throws IOException {
                         int location = this.locationValue(slot);
                         int sectorOffset = location >>> 8;
                         int sectorCount = location & 0xFF;
@@ -205,17 +237,7 @@ final class RegionIo {
                         int compressionType = this.file.readByte();
                         byte[] data = new byte[length - 1];
                         this.file.readFully(data);
-
-                        InputStream raw = switch (compressionType) {
-                                case COMPRESSION_GZIP -> new GZIPInputStream(new ByteArrayInputStream(data));
-                                case COMPRESSION_ZLIB -> new InflaterInputStream(new ByteArrayInputStream(data));
-                                case COMPRESSION_NONE -> new ByteArrayInputStream(data);
-                                default -> throw new IOException("Unknown chunk compression " + compressionType);
-                        };
-
-                        try (InputStream in = new BufferedInputStream(raw)) {
-                                return NbtIo.read(new DataInputStream(in), NbtAccounter.unlimitedHeap());
-                        }
+                        return new RawChunk(slot, this.chunkTimestamp(slot), data, compressionType);
                 }
 
                 @Override

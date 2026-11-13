@@ -1,0 +1,42 @@
+PREUVE-TESTS 1.3.0 - LegacyWorldFix v1.3.0+mc26.3 (serveur dedie 26.3, Java 25)
+Date: 2026-11-13 22:01 UTC
+
+== Monde Beta 1.2 reconstruit au format d'epoque exact (chunks c.<x>.<z>.dat gzips, enveloppe Level, DIM-1) ==
+[22:00:14] [main/INFO] (legacyworldfix) [LegacyWorldFix] Loaded - worlds saved before 1.6.4 (Indev/Classic, Infdev/Alpha, McRegion, early Anvil) can be upgraded again
+[22:00:14] [main/INFO] (legacyworldfix) [LegacyWorldFix] Pre-region world detected (Infdev/Alpha chunk files): /home/z/my-project/legacyworldfix/run/rootstyletest
+[22:00:19] [main/INFO] (legacyworldfix) [LegacyWorldFix] Converted 2 pre-region chunk(s) to Anvil in 4909 ms (data fixes applied in place) - the vanilla upgrade pass is skipped
+[22:00:19] [main/INFO] (legacyworldfix) [LegacyWorldFix] McRegion world detected (level.dat version 19132): /home/z/my-project/legacyworldfix/run/mcregiontest
+[22:00:19] [main/INFO] (legacyworldfix) [LegacyWorldFix] Converted 1 region file(s) / 2 chunk(s) from McRegion to Anvil in 108 ms (data fixes applied in place) - the vanilla upgrade pass is skipped
+[22:00:19] [main/INFO] (legacyworldfix) [LegacyWorldFix] Pre-region world detected (Infdev/Alpha chunk files): /home/z/my-project/legacyworldfix/run/beta12test
+[22:00:20] [main/INFO] (legacyworldfix) [LegacyWorldFix] Converted 7 pre-region chunk(s) to Anvil in 434 ms (data fixes applied in place) - the vanilla upgrade pass is skipped
+[22:00:20] [main/INFO] (legacyworldfix) [LegacyWorldFix] Converted 3 legacy world(s) in /home/z/my-project/legacyworldfix/run before server start
+
+== Aucun passage d'upgrade vanilla ==
+Occurrences de 'Starting upgrade' dans tout le log du serveur : 0
+[22:00:25] [Server thread/INFO] (Minecraft) Done (0.332s)! For help, type "help"
+
+== Verification hors-ligne des 3 mondes convertis (verify_worlds.py) ==
+OK   beta12test/overworld entities: minecraft:pig minecraft:chicken Health=4.0 UUID=True | minecraft:pig Health=10.0 UUID=True | minecraft:pig Health=10.0 UUID=True | minecraft:pig Health=10.0 UUID=True | minecraft:pig Health=10.0 UUID=True | minecraft:sheep Health=8.0 
+OK   beta12test/DIM-1 entities: minecraft:zombified_piglin minecraft:zombified_piglin Health=10.0 UUID=False
+OK   rootstyletest/overworld entities: minecraft:pig minecraft:pig Health=10.0 UUID=False
+OK   mcregiontest/overworld entities: minecraft:pig minecraft:pig Health=10.0 UUID=False
+OK   mcregiontest/overworld entities: Health=10.0 minecraft:pig Health=10.0 UUID=False
+
+RESULT: ALL CHECKS PASSED
+
+== Blocs et tile entities des chunks convertis (nbtlib, region r.0.0.mca de beta12test) ==
+gold_block @ (10,5,10) : minecraft:gold_block
+chest @ (6,6,6)        : minecraft:chest
+spawner @ (20,6,4)     : minecraft:spawner
+stone @ (1,1,1)        : minecraft:stone
+
+Spawner modernise (extrait du chunk (1,0)) :
+  BlockEntity minecraft:mob_spawner @ (20,6,4) SpawnData={entity:{id:'minecraft:pig'}}
+  (l'ancien format d'epoque etait EntityId:"Pig" sans namespace)
+Coffre d'epoque (extrait du chunk (0,0)) :
+  BlockEntity minecraft:chest @ (6,6,6) Items=[{count:1,Slot:0,id:'minecraft:tnt'}]
+
+== Fichiers crees par la replication du file fixing vanilla (beta12test) ==
+  data/minecraft/world_gen_settings.dat  <- {data:{bonus_chest:0,seed:-4172829371415774315,generate_structures:1,dimensions:{overworld,the_nether,the_end}}}, DataVersion=5023
+  players/data/00000000-0000-0000-0000-000000000000.dat <- joueur de level.dat, chaine PLAYER appliquee, DataVersion=5023
+  level.dat : version=19133, DataVersion=5023, Version{Id:5023, Name:26.3}

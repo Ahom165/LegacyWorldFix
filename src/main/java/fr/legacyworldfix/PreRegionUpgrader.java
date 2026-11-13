@@ -5,10 +5,11 @@ import java.nio.file.DirectoryStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
-import java.util.HashMap;
+import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.Callable;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.stream.Stream;
 import net.minecraft.nbt.CompoundTag;
 
@@ -26,8 +27,9 @@ import net.minecraft.nbt.CompoundTag;
  * transformation used for {@code .mcr} payloads (flat 16x16x128 arrays split
  * into 16 sections, entity health normalization) and then pushed through the
  * vanilla datafixer chain, so every chunk lands on disk already at the
- * current data version - one pass, no intermediate McRegion files, and the
- * vanilla world-upgrade pass afterwards becomes a fast no-op. The Nether
+ * current data version - one pass, no intermediate McRegion files, and thanks to
+ * the DataVersion stamps on chunks and level.dat the vanilla world-upgrade pass
+ * afterwards is skipped entirely. The Nether
  * exists since Alpha 1.2 (Halloween update) and is stored the same way
  * inside {@code DIM-1}; every {@code DIM*} folder is converted alongside the
  * overworld, with its real dimension id feeding the datafixer context.
@@ -107,8 +109,23 @@ final class PreRegionUpgrader {
         }
 
         /**
+         * One region file being assembled, shared by all the per-chunk tasks that
+         * target it. Chunks are decompressed, transformed, DFU-upgraded and
+         * re-compressed in parallel; only the cheap in-memory append runs under the
+         * region's lock, and the file itself is written once at the end.
+         */
+        private record RegionTarget(Path file, RegionIo.AnvilRegionWriter writer, List<Path> convertedFiles) {
+                RegionTarget(Path file) {
+                        this(file, new RegionIo.AnvilRegionWriter(), Collections.synchronizedList(new ArrayList<>()));
+                }
+        }
+
+        /**
          * Converts every legacy chunk file into Anvil region files under
-         * {@code region/}. Work is parallelized per region file.
+         * {@code region/}. Work is parallelized per chunk: a dense Alpha map touches
+         * only a handful of region files, so per-region granularity would leave
+         * cores idle - the expensive part (gzip read + shape transform + vanilla
+         * datafixers) must run one chunk at a time across the pool.
          *
          * @return the number of chunks converted
          */
@@ -118,49 +135,47 @@ final class PreRegionUpgrader {
                         return 0L;
                 }
 
-                // Group by target region file (which already encodes its dimension
-                // folder): each group becomes one independent task.
-                Map<Path, List<LegacyChunk>> byRegion = new HashMap<>();
-                for (LegacyChunk chunk : chunks) {
-                        Path regionFile = chunk.dimensionRoot().resolve("region")
-                                .resolve("r." + (chunk.x() >> 5) + "." + (chunk.z() >> 5) + ".mca");
-                        byRegion.computeIfAbsent(regionFile, key -> new ArrayList<>()).add(chunk);
-                }
-
-                List<Callable<Long>> tasks = new ArrayList<>();
-                for (Map.Entry<Path, List<LegacyChunk>> entry : byRegion.entrySet()) {
-                        Path regionFile = entry.getKey();
-                        Files.createDirectories(regionFile.getParent());
-                        tasks.add(() -> convertRegionGroup(regionFile, entry.getValue(), generatorId));
-                }
-
-                return LegacyMcRegionUpgrader.runInParallel(tasks);
-        }
-
-        private static long convertRegionGroup(Path regionFile, List<LegacyChunk> group, String generatorId) throws IOException {
-                RegionIo.AnvilRegionWriter writer = new RegionIo.AnvilRegionWriter();
-                List<Path> converted = new ArrayList<>();
-                for (LegacyChunk chunk : group) {
+                Map<Path, RegionTarget> targets = new ConcurrentHashMap<>();
+                List<Callable<Long>> tasks = chunks.stream().<Callable<Long>>map(chunk -> () -> {
                         CompoundTag root;
                         try {
                                 root = RegionIo.readGzippedNbt(chunk.file());
                         } catch (IOException e) {
                                 LegacyWorldFix.LOGGER.error("[LegacyWorldFix] Skipping unreadable pre-region chunk {}: {}", chunk.file(), e.toString());
-                                continue;
+                                return 0L;
                         }
 
+                        CompoundTag transformed;
                         try {
-                                writer.writeChunk(slotOf(chunk.x(), chunk.z()), timestampOf(chunk.file()), transform(root, chunk, generatorId));
-                                converted.add(chunk.file());
+                                transformed = transform(root, chunk, generatorId);
                         } catch (Exception e) {
                                 LegacyWorldFix.LOGGER.error("[LegacyWorldFix] Skipping corrupt pre-region chunk {}: {}", chunk.file(), e.toString());
+                                return 0L;
                         }
+
+                        Path regionFile = chunk.dimensionRoot().resolve("region")
+                                .resolve("r." + (chunk.x() >> 5) + "." + (chunk.z() >> 5) + ".mca");
+                        RegionTarget target = targets.computeIfAbsent(regionFile, RegionTarget::new);
+                        byte[] compressed = RegionIo.zlibNbt(transformed);
+                        synchronized (target) {
+                                target.writer().writeCompressedChunk(slotOf(chunk.x(), chunk.z()), timestampOf(chunk.file()), compressed);
+                                target.convertedFiles().add(chunk.file());
+                        }
+                        return 1L;
+                }).toList();
+
+                LegacyMcRegionUpgrader.runInParallel(tasks);
+
+                // Only once every chunk is in memory may the region files be written and
+                // the source files removed.
+                long written = 0L;
+                for (RegionTarget target : targets.values()) {
+                        target.writer().saveTo(target.file());
+                        written += target.writer().count();
+                        deleteLegacyChunkFiles(target.convertedFiles());
                 }
 
-                writer.saveTo(regionFile);
-                // Only after the region file is safely on disk may the source files go.
-                deleteLegacyChunkFiles(converted);
-                return writer.count();
+                return written;
         }
 
         /**
