@@ -1,0 +1,64 @@
+BENCHMARK PERFORMANCES - v1.4.0 (14 novembre 2026)
+====================================================
+
+Question : « tu peux pas refaire le truc plus rapide, genre en Rust avec JNI ? »
+
+Méthode
+-------
+Benchmark autonome exécuté contre le jar Minecraft 26.3 réel (mappé, celui du
+build) + DataFixerUpper 10.0.21, avec des chunks Alpha synthétiques réalistes
+(terrain 16x16x128 avec grottes/minerais, coffre avec items numériques d'époque,
+fourneau, spawner `EntityId`, mobs à `Health` short). Deux mesures séparées :
+
+  1. LegacyMcRegionUpgrader.transformChunkNbt seul (reshape + NBT)
+  2. DataFixTypes.CHUNK.update(fixer, -1 -> 5023) sur le résultat
+
+Résultats (CPU serveur 2 coeurs, JDK 25, G1)
+--------------------------------------------
+  reshape McRegion -> Anvil + gzip + zlib : ~0,4-0,9 ms/chunk
+  chaîne DFU 99 -> 5023, single-thread    : ~62-66 ms/chunk
+  => le DFU représente ~98 % du temps de conversion.
+
+Profiling JFR (hot-methods) : le temps est réparti uniformément dans le MOTEUR
+DFU (PointFree.evalCached, comparaisons structurelles de types Sum/Product,
+HashMap, hashCode de String...) - aucun datafixer individuel ne domine.
+
+Conséquence : réécrire l'E/S en Rust/JNI ne toucherait pas les 98 %. Réécrire le
+DFU signifierait réimplémenter ~500 règles de format monde (10 ans). Le levier
+honnête est donc (a) saturer les coeurs, (b) alléger ce qui traverse la chaîne.
+
+Optimisations 1.4.0 et leurs preuves
+------------------------------------
+1. Light (SkyLight/BlockLight) retirées avant la chaîne :
+   - Mesuré : 66 -> ~48-52 ms/chunk (~-20 %), et fichiers de sortie plus petits
+     (les sections tout-air ne portent plus de palettes gonflées + data).
+   - Équivalence prouvée : chaîne complète exécutée sur les deux formes
+     (avec/sans light), sorties comparées récursivement champ par champ :
+     seules différences = light (attendu), UpgradeData Indices [] vs absent
+     (équivalent), ordre des sections -4..-1 ajoutées par le fix below-zero
+     (sans importance), et sections tout-air normalisées (palette [air]).
+   - Légitimité : vanilla fait pareil - ChunkDeleteLightFix retire
+     BlockLight/SkyLight des sections, ChunkLightRemoveFix retire isLightOn ;
+     le moteur de light recalcule tout au chargement (chemin prévu du jeu).
+2. Tous les coeurs logiques (c'était coeurs - 1, plafond 16 -> 32).
+3. Warm-up : première tâche exécutée seule avant le fan-out - la règle DFU
+   (composition des ~500 fixers pour la paire 99 -> 5023) est composée une fois
+   single-thread au lieu d'une course concurrente sur le cache de règles
+   (DataFixerUpper.rules, Long2ObjectMap.computeIfAbsent non thread-safe en
+   écriture - du vrai durcissement, pas que de la perf).
+4. Logs enrichis : "~X ms/chunk on N threads" -> la prochaine exécution réelle
+   dira exactement ce que fait la machine (coeur par chunk + parallélisme).
+
+Sur le monde réel de test (1 195 chunks Alpha v1.2.1_01)
+--------------------------------------------------------
+  v1.3.0 : 28 214 ms (~23,6 ms/chunk effectif)
+  v1.4.0 attendu : ~20 s selon le CPU (-20 % light + coeurs supplémentaires),
+  la limite restante étant la chaîne DFU elle-même (Mojang, Java).
+
+Vérifications d'intégrité
+-------------------------
+  - plus aucun "SkyLight"/"BlockLight" dans LegacyMcRegionUpgrader/PreRegionUpgrader
+    (light d'entrée ignorées ; HeightMap et Data conservés) ;
+  - data version cible inchangée : 5023 (26.3) ;
+  - pas de changement de format : le DFU s'applique toujours, les chunks sortent
+    estampillés 5023, l'upgrade vanilla reste court-circuité.

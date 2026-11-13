@@ -25,13 +25,40 @@ d'époque exact — enveloppe `Level`, noms base36 signés (`1f/18/c.-d.18.dat`)
 sans tag `version` : terrain, coffres (contenu inclus), cochons vivants, chunks négatifs
 et Nether arrivent tous intacts en 26.3 (voir `docs/PREUVE-TESTS-1.1.1.txt`).
 
+**Nouveau dans la 1.4.0** : la conversion passe encore plus vite, et les logs disent
+maintenant *pourquoi* :
+
+- **les tableaux de lumière ne traversent plus la chaîne de datafixers**. La chaîne
+  vanilla elle-même les supprime en cours de route (`ChunkDeleteLightFix`,
+  `ChunkLightRemoveFix`) puisque le moteur de light moderne les recalcule depuis les
+  blocs au chargement : les retirer à la source économise ~4 Kio par section copiés dans
+  chacune des ~500 règles, soit **~-20 % sur le temps DFU** et des `.mca` plus petits.
+  Sortie vérifiée équivalente (chaîne complète exécutée sur les deux formes, sortie
+  comparée champ par champ) ;
+- **tous les cœurs logiques** sont utilisés (au lieu de `cœurs - 1`, plafond relevé à 32) :
+  la conversion bloque le thread appelant de toute façon ;
+- la **première tâche s'exécute seule** avant le fan-out : la règle DFU (composition des
+  ~500 fixers pour la paire 99 → 5023) est composée une fois, single-thread, au lieu d'une
+  stampede concurrente sur le cache de règles (qui n'est pas thread-safe en composition) ;
+- le log de fin de conversion affiche désormais **`~X ms/chunk on N threads`** — la
+  prochaine exécution dira exactement ce que fait la machine.
+
+**Pourquoi pas Rust/JNI ?** Mesuré (benchmark sur le jar 26.3 réel) : la transformation
+McRegion → Anvil + gzip + zlib coûte **~0,9 ms/chunk**, la chaîne DataFixerUpper
+**~66 ms/chunk** — c'est-à-dire ~98 % du temps dans le moteur DFU de Mojang, du code Java
+qu'il faut bien exécuter tel quel pour que le monde soit correctement remonté (profiling
+JFR : temps réparti uniformément dans le moteur — `PointFree`, comparaisons de types,
+caches — aucun fixer individuel ne domine). Réécrire l'E/S en Rust ne toucherait pas les
+98 % ; réécrire le DFU signifierait réimplémenter dix ans de règles de format monde.
+Le seul levier honnête : saturer les cœurs (fait) et alléger ce qui traverse la chaîne
+(light, fait).
+
 **Nouveau dans la 1.3.0** : la conversion devient **par chunk** et l'upgrade vanilla
 **disparaît complètement** :
 
 - le travail lourd (lecture gzip + transformation + chaîne DataFixerUpper + zlib) tourne
   **une tâche par chunk** dans le pool (un monde Alpha dense ne touche que quelques fichiers
-  de région : l'ancienne granularité « par région » laissait les cœurs inactifs — sur un
-  monde réel de 1 195 chunks, la conversion passe de ~21 s à ~4-6 s selon la machine) ;
+  de région : l'ancienne granularité « par région » laissait les cœurs inactifs) ;
 - `level.dat` est remonté **en place** par la chaîne LEVEL vanilla et reçoit le tag
   `DataVersion` courant (5023) + le tag `Version` — le passage « Starting upgrade for
   world » de vanilla **ne démarre plus du tout** (plus de copie avec hardlinks, plus de

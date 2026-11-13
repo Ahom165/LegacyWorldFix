@@ -207,10 +207,9 @@ final class IndevConverter {
                 level.putBoolean("TerrainPopulated", true);
                 level.putByteArray("Blocks", chunkBlocks);
                 level.putByteArray("Data", chunkData);
-                level.putByteArray("BlockLight", new byte[16384]);
-                // Full daylight above ground; the modern light engine refines it once the
-                // chunk is loaded (light is recalculated, not trusted, for such old worlds).
-                level.putByteArray("SkyLight", daylightArray(chunkBlocks));
+                // No light arrays: the shared transformation drops them (the vanilla
+                // upgrade chain deletes them too and the light engine rebuilds them
+                // from the block data on load).
                 level.putByteArray("HeightMap", heightMap);
 
                 ListTag chunkEntities = selectByPosition(entities, baseX, baseZ);
@@ -223,17 +222,6 @@ final class IndevConverter {
                 root.put("Level", level);
                 // Indev maps are always overworld, always noise-based (no superflat in 2010).
                 return LegacyMcRegionUpgrader.transformAndUpgradeChunk(root, "minecraft:overworld", "minecraft:noise");
-        }
-
-        /** 15 (fully lit) for every air block, 0 elsewhere - a sane starting point the light engine will refine. */
-        private static byte[] daylightArray(byte[] chunkBlocks) {
-                byte[] skyLight = new byte[16384];
-                for (int index = 0; index < 32768; index++) {
-                        if (chunkBlocks[index] == 0) {
-                                LegacyMcRegionUpgrader.setNibble(skyLight, index, 0x0F);
-                        }
-                }
-                return skyLight;
         }
 
         /** Copies the entities whose position falls into this chunk. */

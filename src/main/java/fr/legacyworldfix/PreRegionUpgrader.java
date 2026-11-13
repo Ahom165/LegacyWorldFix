@@ -242,12 +242,12 @@ final class PreRegionUpgrader {
                 if (!level.contains("TerrainPopulated")) {
                         level.putBoolean("TerrainPopulated", true);
                 }
-                // Very early chunks may predate the light/heightmap tags. Missing light
-                // cannot be reconstructed here, so assume full daylight (the modern light
-                // engine re-checks it) and derive the heightmap from the block array.
+                // Very early chunks may predate the heightmap tag: derive it from the
+                // block array. The old light arrays are intentionally NOT filled in -
+                // the transformation drops light entirely (the vanilla upgrade chain
+                // deletes it too, and the modern light engine rebuilds it from the
+                // block data on load).
                 fillIfMissing(level, "Data", 16384, (byte) 0);
-                fillIfMissing(level, "BlockLight", 16384, (byte) 0);
-                fillIfMissing(level, "SkyLight", 16384, (byte) 0xFF);
                 if (!level.contains("HeightMap")) {
                         level.putByteArray("HeightMap", computeHeightMap(level));
                 }
