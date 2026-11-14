@@ -14,7 +14,7 @@ Ce qui a été recodé dans le hot path
    En sortie : sections ciel minimales ou absentes, fichiers .mca plus petits.
    ÉQUIVALENCE PRÉUVELÉE (mode "slim" de BenchDfu) : 72 chunks (terrains
    x0.35 / x1.0 / x1.7 + chunk tout-air), 264 sections retirées :
-     - sections conservées : identiques octet pour octel après DFU ;
+     - sections conservées : identiques octet pour octet après DFU ;
      - sections retirées : recréées par la chaîne elle-même en sections
        minimales [air] (ou absentes) - décodage vérifié 4096/4096 entrées air ;
      - champs de chunk : identiques modulo UpgradeData Indices [] vs absent
