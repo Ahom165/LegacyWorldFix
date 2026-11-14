@@ -166,16 +166,22 @@ final class PreRegionUpgrader {
 
                 LegacyMcRegionUpgrader.runInParallel(tasks);
 
-                // Only once every chunk is in memory may the region files be written and
-                // the source files removed.
-                long written = 0L;
-                for (RegionTarget target : targets.values()) {
-                        target.writer().saveTo(target.file());
-                        written += target.writer().count();
-                        deleteLegacyChunkFiles(target.convertedFiles());
-                }
-
-                return written;
+                // Region files are saved and their source chunk files deleted in
+                // parallel, one task per region: the writers are independent and the
+                // deletes are pure filesystem work (hundreds of small files on
+                // Windows NTFS add up). Every chunk of a region is already in the
+                // writer's memory at this point, so nothing races. A failure in one
+                // task rethrows after all tasks finished, leaving the world an honest
+                // pre-region world (level.dat untouched) whose retry converts the
+                // remaining files; saves that succeeded keep their regions.
+                List<Callable<Long>> writes = targets.values().stream()
+                        .<Callable<Long>>map(target -> () -> {
+                                target.writer().saveTo(target.file());
+                                deleteLegacyChunkFiles(target.convertedFiles());
+                                return (long) target.writer().count();
+                        })
+                        .toList();
+                return LegacyMcRegionUpgrader.runInParallel(writes);
         }
 
         /**

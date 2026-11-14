@@ -1,0 +1,68 @@
+BENCHMARK PERFORMANCES - v1.5.0 (14 novembre 2026)
+====================================================
+
+Question : « recode les morceau du dfu mal opti stp »
+
+Ce qui a été recodé dans le hot path
+------------------------------------
+1. Sections tout-air retirées AVANT la chaîne DFU (transformChunkNbt).
+   Le nouveau filtre retire les sections 100 % air à la source. Ce n'est pas
+   seulement une question de vitesse : la chaîne DFU transforme une section
+   tout-air legacy en section "gonflée" (palette de 9 entrées + ~2 Ko de data
+   compressée par section de ciel) — exactement ce que vanilla ne produit
+   jamais à la sauvegarde (ChunkSerializer.write omet les sections hasOnlyAir).
+   En sortie : sections ciel minimales ou absentes, fichiers .mca plus petits.
+   ÉQUIVALENCE PRÉUVELÉE (mode "slim" de BenchDfu) : 72 chunks (terrains
+   x0.35 / x1.0 / x1.7 + chunk tout-air), 264 sections retirées :
+     - sections conservées : identiques octet pour octel après DFU ;
+     - sections retirées : recréées par la chaîne elle-même en sections
+       minimales [air] (ou absentes) - décodage vérifié 4096/4096 entrées air ;
+     - champs de chunk : identiques modulo UpgradeData Indices [] vs absent
+       (équivalence déjà prouvée en 1.4.0), ordre de la liste et type du tag Y
+       (byte vs int) - vanilla résout les sections par leur Y, pas par l'ordre.
+   Chunk tout-air : gardé tel quel (8 sections), cas border non prouvé et rare.
+
+2. DFU pré-construit en arrière-plan dès l'init du mod (nouveau thread daemon).
+   Le singleton vanilla est paresseux : sa construction (~700-820 ms mesuré)
+   + la composition de règle CHUNK (~100 ms) atterrissaient dans la fenêtre
+   de conversion. Désormais ils passent pendant l'écran de titre (client) ou
+   en parallèle du scan des mondes (serveur). Log dédié :
+   "Datafixer ready in X ms (prebuilt in background)".
+
+3. Écriture des region files + suppression des fichiers legacy PARALLÉLISÉES.
+   Avant : boucle séquentielle (1 tâche I/O par region + suppression des
+   c.<x>.<z>.dat + rmdir base36). Sur NTFS Windows, ~1195 petits fichiers +
+   dossiers coûtent ~1 s. Un task par region file, échec repropagé après
+   complétion de tous (le monde reste un monde legacy honnête en cas d'échec).
+
+Vérité sur les gains (mesures propres, JIT chaud, les deux formes dans le
+même processus - mode "compare" de BenchDfu, CPU 2 coeurs, JDK 25)
+--------------------------------------------------------------------
+  DFU full (v1.4.0)     : 36,5 ms/chunk
+  DFU slim (v1.5.0)     : 35,2 ms/chunk   (+4 % sur la conversion)
+  2 threads             : 27,2 -> 25,5 ms/chunk effectif
+  reshape + I/O         : ~0,4-0,9 ms/chunk (inchangé, négligeable)
+  construction DFU      : ~0,7-0,8 s (une fois, désormais masquée)
+  taille sortie         : sections ciel gonflées éliminées des .mca
+
+NOTE D'HONNÊTETÉ : le "x2.16" cru qu'on peut lire en comparant une mesure
+froide (80 ms) et une mesure chaude (37 ms) est un artefact de ramp-up JIT.
+À JIT égal, le gain conversion est de ~4-6 %. Le gain RÉEL utilisateur est :
+fichiers de sortie plus petits, ~1 s d'I/O parallélisées, ~0,8 s de build DFU
+masqué, et un log par phase.
+
+Où est la limite restante
+-------------------------
+Le profil JFR ne change pas : le temps est dans le MOTEUR DataFixerUpper
+(PointFree.evalCached, comparaisons structurelles de types) - coût ~fixe par
+chunk, pas par octet. C'est le code de Mojang, partagé avec l'upgrade vanilla ;
+le seul levier restant est le parallélisme (fait : tous les coeurs logiques),
+et la ligne de log "~X ms/chunk on N threads" dit exactement ce que fait la
+machine. Sur 1195 chunks : temps = ~35 ms x 1195 / N coeurs effectifs.
+
+Vérifications d'intégrité
+-------------------------
+  - data version cible inchangée : 5023 (26.3) ;
+  - l'upgrade vanilla reste court-circuité ("Starting upgrade" : 0 occurrence) ;
+  - E2E serveur dédié complet (PREUVE-TESTS-1.5.0.txt) : entités, blocs,
+    coffre, spawner modernisé, Nether - tout identique à la 1.4.0.
