@@ -1,0 +1,148 @@
+PROOF — Player data repair (LegacyWorldFix 1.8.1, Minecraft 26.3)
+==================================================================
+
+SYMPTOM REPORTED
+----------------
+World converts and loads fine, but the player's inventory / position / XP
+("l'inv et les cos du joueur") do not carry over: the game spawns a fresh
+player.
+
+ROOT CAUSE — found in the decompiled 26.3 game sources
+------------------------------------------------------
+1) net.minecraft.world.level.storage.LevelResource (26.3):
+
+     public static final LevelResource PLAYER_DATA_DIR = new LevelResource("players/data");
+     public static final LevelResource PLAYER_OLD_DATA_DIR = new LevelResource("players");
+
+   net.minecraft.world.level.storage.PlayerDataStorage (26.3) reads ONLY
+   <uuid>.dat / <uuid>.dat_old from that folder - the historical name-based
+   fallback (players/<name>.dat) is GONE in 26.x:
+
+     public Optional<CompoundTag> load(final NameAndId nameAndId) {
+        Optional<CompoundTag> optTag = this.load(nameAndId, ".dat");
+        if (optTag.isEmpty()) this.backup(nameAndId, ".dat");
+        return optTag.or(() -> this.load(nameAndId, ".dat_old")).map(tag -> {
+           int version = NbtUtils.getDataVersion(tag);
+           return DataFixTypes.PLAYER.updateToCurrentVersion(this.fixerUpper, tag, version);
+        });
+     }
+
+2) net.minecraft.server.players.PlayerList (26.3) - how the singleplayer
+   owner's file is resolved:
+
+     public Optional<CompoundTag> loadPlayerData(final NameAndId nameAndId) {
+        UUID lastSingleplayerOwnerUUID = this.server.getWorldData().getSinglePlayerUUID();
+        if (this.server.isSingleplayerOwner(nameAndId) && lastSingleplayerOwnerUUID != null) {
+           return this.playerIo.load(new NameAndId(lastSingleplayerOwnerUUID, "<singleplayer owner>"));
+        } else {
+           return this.playerIo.load(nameAndId);
+        }
+     }
+
+   ... and PrimaryLevelData.parse reads that key from level.dat:
+   input.get("singleplayer_uuid").flatMap(UUIDUtil.CODEC::parse).
+
+3) Mod <= 1.8.0 extracted the level.dat player correctly (PLAYER datafixer
+   chain, nil-uuid fallback, singleplayer_uuid recorded) but wrote the file
+   to <world>/playerdata/ whenever the per-dimension chunk layout was
+   detected (StorageLayout coupled the two layouts). This 26.3 build reads
+   chunks from dimensions/minecraft/<dimension>/ (DimensionStorageFileFix is
+   shipped) AND players from players/data/ - the two folders moved in
+   different releases and are NOT coupled. The player file therefore landed
+   in a folder the running game never opens => fresh player at every launch.
+
+   net.minecraft.util.filefix.fixes.PlayerStorageFileFix (the vanilla move,
+   filefixer schema 4772) confirms the direction:
+
+     addFileFixOperation(move("advancements", "players/advancements"));
+     addFileFixOperation(move("playerdata",     "players/data"));
+     addFileFixOperation(move("stats",          "players/stats"));
+
+FIX (1.8.1)
+-----------
+- StorageLayout.playerDataDir() now resolves LevelResource.PLAYER_DATA_DIR
+  of the RUNNING build (players/data on 26.3) instead of guessing from the
+  chunk layout.
+- StorageLayout migration direction corrected to the vanilla
+  PlayerStorageFileFix direction (playerdata -> players/data, advancements
+  -> players/advancements, stats -> players/stats), with per-file merge when
+  the target already exists (game-written files win).
+- New PlayerDataUpgrader: vanilla-order extraction of the level.dat player
+  (BEFORE the LEVEL chain, like LevelDatToSavedDataFileFix), migration of
+  legacy players/<name>.dat files under the deterministic OfflinePlayer:<name>
+  uuid, singleplayer_uuid backfill when the owner file is unambiguous,
+  repair of worlds converted by mod <= 1.8.0.
+- needsLayoutMigration now also reports these player-repair cases (Player
+  tag still in a stamped level.dat, name files without migrated counterpart)
+  so the launch flow runs the repair; the check is convergent (false once
+  repaired), so no repeated conversion screens.
+
+PROBE 1 — PLAYER chain convergence (PlayerDfuProbe)
+---------------------------------------------------
+Raw pre-1.13 player tag (numeric item ids 1 / 278 / 95):
+
+  == LEVEL chain alone on Data (with Player) ==
+  slots: id=1, id=278, id=95          <- the LEVEL chain does NOT touch
+                                         the embedded player (ids stay numeric)
+  == Path B (vanilla): PLAYER chain on raw tag ==
+  slot 0 id="minecraft:stone"
+  slot 1 id="minecraft:diamond_pickaxe"
+  slot 2 id="minecraft:light_blue_stained_glass"
+  == Path A (mod <=1.8.0): LEVEL chain, then PLAYER chain from -1 ==
+  slot 0 id="minecraft:stone"
+  slot 1 id="minecraft:diamond_pickaxe"
+  slot 2 id="minecraft:light_blue_stained_glass"
+  == verdict ==
+  pathA == pathB : true                <- running the PLAYER chain on an
+                                         already-LEVEL-fixed tag is exactly
+                                         equivalent to vanilla's raw run:
+                                         the extraction of <= 1.8.0 worlds is
+                                         content-correct, only the folder
+                                         was wrong; re-extraction is safe.
+
+PROBE 2 — E2E player repair (PlayerRepairProbe, 23/23 checks)
+-------------------------------------------------------------
+World A - Beta-style McRegion world (level.dat version 19132, embedded
+          player with numeric ids, players/Steve.dat):
+  OK   A: needsLayoutMigration true before
+  OK   A: needsLayoutMigration false after
+  OK   A: DataVersion stamped to 5023
+  OK   A: storage version stamped to 19133
+  OK   A: Player removed from level.dat
+  OK   A: singleplayer_uuid = nil uuid
+  OK   A: embedded player inventory namespaced (minecraft:stone)
+  OK   A: players/Steve.dat migrated under the offline uuid
+  OK   A: world_gen_settings.dat written
+  OK   A: player file stamped with DataVersion 5023
+World B - what mod 1.8.0 left behind (level.dat stamped, singleplayer_uuid
+          nil, player file stuck in playerdata/):
+  OK   B: needsLayoutMigration true before
+  OK   B: needsLayoutMigration false after
+  OK   B: playerdata/ folder gone
+  OK   B: player file now in players/data/
+  OK   B: player file content intact
+  OK   B: singleplayer_uuid untouched
+  OK   B: level.dat DataVersion untouched
+World C - already-Anvil world whose embedded player was never extracted:
+  OK   C: needsLayoutMigration true before
+  OK   C: needsLayoutMigration false after
+  OK   C: Player removed from level.dat
+  OK   C: singleplayer_uuid recorded
+  OK   C: stuck player extracted and namespaced
+  OK   C: DataVersion untouched
+  ALL PLAYER REPAIR CHECKS PASSED
+(Each world runs prepareWorld twice - the second run changes nothing.)
+
+PROBE 3 — chunk conversion regression (unchanged pipeline)
+----------------------------------------------------------
+LaunchFlowProbe on beta12test / rootstyletest / mcregiontest: PROBE OK x3.
+verify_worlds.py on the fresh conversions: ALL CHECKS PASSED (level.dat
+version=19133 / DataVersion=5023 / Version.Id=5023, pigs in overworld +
+zombified piglin in the nether entities containers).
+
+GAME-SIDE EFFECT (what the player sees)
+---------------------------------------
+On the first launch after updating the mod, a world converted by <= 1.8.0
+shows the conversion screen for the duration of a folder move, then opens
+with the original inventory / position / XP restored through
+players/data/<singleplayer_uuid>.dat.

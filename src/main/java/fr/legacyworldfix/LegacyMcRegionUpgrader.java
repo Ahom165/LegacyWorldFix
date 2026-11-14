@@ -10,6 +10,7 @@ import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.UUID;
 import java.util.concurrent.Callable;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutionException;
@@ -69,6 +70,11 @@ public final class LegacyMcRegionUpgrader {
          * Hoisted once instead of re-walking the version objects for every chunk.
          */
         private static final int CURRENT_DATA_VERSION = SharedConstants.getCurrentVersion().dataVersion().version();
+
+        /** Current data version of the running build, for the sibling upgraders. */
+        static int currentDataVersion() {
+                return CURRENT_DATA_VERSION;
+        }
 
         /**
          * One worker per logical core: the conversion blocks the calling thread
@@ -160,12 +166,59 @@ public final class LegacyMcRegionUpgrader {
         }
 
         /**
-         * Read-only check for the launch flow: does this already-Anvil world sit
-         * in a storage layout the running build no longer reads? The migration
-         * itself (cheap, deterministic folder moves) runs in {@link #prepareWorld}.
+         * Read-only check for the launch flow: does this already-Anvil world
+         * need a preparation pass before it can open with all its data? That
+         * covers a storage layout the running build no longer reads (chunk or
+         * player folders) and player data the running game can no longer reach
+         * (an embedded level.dat player an older mod release failed to
+         * extract, or name-based player files 26.x ignores). The work itself
+         * (cheap, deterministic moves plus one small NBT read) runs in
+         * {@link #prepareWorld}.
          */
         public static boolean needsLayoutMigration(Path worldDir) {
-                return StorageLayout.needsPerDimensionMigration(worldDir);
+                if (StorageLayout.needsPerDimensionMigration(worldDir)) {
+                        return true;
+                }
+                return needsPlayerRepair(worldDir);
+        }
+
+        /**
+         * Cheap level.dat / directory-shape check for player data the running
+         * build would silently ignore: the singleplayer player still embedded
+         * in level.dat (26.x reads players only from their own files), or
+         * name-based {@code players/<name>.dat} files (the name-based fallback
+         * was removed) that have no migrated counterpart under the player data
+         * folder yet. Converges to false once {@code PlayerDataUpgrader} ran.
+         */
+        private static boolean needsPlayerRepair(Path worldDir) {
+                try {
+                        CompoundTag root = NbtIo.readCompressed(worldDir.resolve("level.dat"), NbtAccounter.unlimitedHeap());
+                        if (!root.getCompoundOrEmpty("Data").getCompoundOrEmpty("Player").isEmpty()) {
+                                return true;
+                        }
+                        Path playersDir = worldDir.resolve("players");
+                        Path dataDir = StorageLayout.playerDataDir(worldDir);
+                        if (Files.isDirectory(playersDir)) {
+                                try (DirectoryStream<Path> stream = Files.newDirectoryStream(playersDir, "*.dat")) {
+                                        for (Path file : stream) {
+                                                String fileName = file.getFileName().toString();
+                                                String playerName = fileName.substring(0, fileName.length() - 4);
+                                                // Backups are not players; underscores are legal inside names.
+                                                if (fileName.endsWith("_old.dat") || fileName.contains("_corrupted_")) {
+                                                        continue;
+                                                }
+                                                UUID offlineUuid = UUID.nameUUIDFromBytes(
+                                                        ("OfflinePlayer:" + playerName).getBytes(java.nio.charset.StandardCharsets.UTF_8));
+                                                if (!Files.isRegularFile(dataDir.resolve(offlineUuid + ".dat"))) {
+                                                        return true;
+                                                }
+                                        }
+                                }
+                        }
+                        return false;
+                } catch (IOException | RuntimeException e) {
+                        return false;
+                }
         }
 
         private LegacyMcRegionUpgrader() {
@@ -276,6 +329,20 @@ public final class LegacyMcRegionUpgrader {
                         } catch (IOException e) {
                                 LegacyWorldFix.LOGGER.warn(
                                         "[LegacyWorldFix] Could not migrate the storage layout of {}: {} - the world keeps the previous folder layout",
+                                        worldDir,
+                                        e.toString());
+                        }
+
+                        // Player data first, whatever the world's storage format: the
+                        // embedded player leaves level.dat before the LEVEL chain runs
+                        // (the vanilla file-fix order), legacy name-based files move into
+                        // the layout this build reads, and worlds an older mod release
+                        // extracted into a stale folder get their players back.
+                        try {
+                                PlayerDataUpgrader.repairWorld(worldDir);
+                        } catch (IOException | RuntimeException e) {
+                                LegacyWorldFix.LOGGER.warn(
+                                        "[LegacyWorldFix] Could not repair the player data of {}: {} - player data stays as it is",
                                         worldDir,
                                         e.toString());
                         }
@@ -883,7 +950,7 @@ public final class LegacyMcRegionUpgrader {
                         LegacyWorldFix.LOGGER.warn("[LegacyWorldFix] Level rule warmup incomplete: {}", t.toString());
                 }
                 try {
-                        // PLAYER: the level.dat player (movePlayerToPlayerData).
+                        // PLAYER: the level.dat player (PlayerDataUpgrader.extractEmbeddedPlayer).
                         DataFixTypes.PLAYER.update(DataFixers.getDataFixer(), new CompoundTag(), NbtUtils.getDataVersion(new CompoundTag(), -1), CURRENT_DATA_VERSION);
                 } catch (Throwable t) {
                         LegacyWorldFix.LOGGER.warn("[LegacyWorldFix] Player rule warmup incomplete: {}", t.toString());
@@ -906,17 +973,17 @@ public final class LegacyMcRegionUpgrader {
         }
 
         /**
-         * Rewrites level.dat the way the vanilla 26.x "file fixing" pass would:
-         * the storage version goes to Anvil, the whole LEVEL datafixer chain runs
-         * in place, the current DataVersion is stamped, and the state the current
-         * version expects in separate saved-data files ({@code world_gen_settings.dat},
-         * {@code players/data/<uuid>.dat}) is extracted there. With the DataVersion
-         * stamp vanilla skips its entire upgrade flow on load ("Starting upgrade
-         * for world" never appears): no filefix copy with hardlinks, no region
-         * rescan - the world opens right away.
+         * Rewrites level.dat the way the vanilla 26.x upgrade flow would:
+         * first the file-fix extractions on the raw data (the level.dat player
+         * moves to {@code players/data/<uuid>.dat} through the PLAYER chain and
+         * worldgen settings move to {@code world_gen_settings.dat}), then the
+         * LEVEL datafixer chain runs in place, then the current DataVersion is
+         * stamped. With the DataVersion stamp vanilla skips its entire upgrade
+         * flow on load ("Starting upgrade for world" never appears): no filefix
+         * copy with hardlinks, no region rescan - the world opens right away.
          *
-         * <p>If the LEVEL upgrade unexpectedly fails, nothing is extracted and
-         * level.dat keeps no DataVersion, so vanilla runs its own (slow but
+         * <p>If the LEVEL upgrade unexpectedly fails, the extracted files stay
+         * and level.dat keeps no DataVersion, so vanilla runs its own (slow but
          * identical) pass later.
          */
         private static void patchLevelDat(Path worldDir, Path levelDat, String defaultLevelName, boolean writeSavedDataFiles) throws IOException {
@@ -931,6 +998,15 @@ public final class LegacyMcRegionUpgrader {
                 boolean legacyMapFeatures = data.getBooleanOr("MapFeatures", true);
 
                 int currentVersion = CURRENT_DATA_VERSION;
+
+                // The vanilla file fixers run BEFORE the LEVEL chain: the player
+                // leaves level.dat through the PLAYER chain (that is where item ids
+                // get their namespaces) and worldgen settings through their own type.
+                if (writeSavedDataFiles) {
+                        PlayerDataUpgrader.extractEmbeddedPlayer(worldDir, data);
+                        writeWorldGenSettings(worldDir, data, legacyLevelType, legacySeed, legacyMapFeatures, currentVersion);
+                }
+
                 int dataVersion = data.getIntOr("DataVersion", -1);
                 boolean levelFixed = true;
                 if (dataVersion < currentVersion) {
@@ -949,10 +1025,6 @@ public final class LegacyMcRegionUpgrader {
                 }
 
                 if (levelFixed) {
-                        if (writeSavedDataFiles) {
-                                writeWorldGenSettings(worldDir, data, legacyLevelType, legacySeed, legacyMapFeatures, currentVersion);
-                                movePlayerToPlayerData(worldDir, data, currentVersion);
-                        }
                         NbtUtils.addDataVersion(data, currentVersion);
                         // Same "Version" tag vanilla's addVersionsToLevelData writes, so
                         // the world list shows the world as a current-version world.
@@ -1063,46 +1135,6 @@ public final class LegacyMcRegionUpgrader {
                 dimension.putString("type", "minecraft:overworld");
                 dimension.put("generator", generator);
                 return dimension;
-        }
-
-        /**
-         * Replicates the player part of the vanilla file fix: the level.dat player
-         * moves to {@code players/data/<uuid>.dat} with the PLAYER datafixer chain
-         * applied (that is where item ids get their namespaces), and level.dat
-         * records the UUID under {@code singleplayer_uuid}. Players without a UUID
-         * (every pre-1.8 save) get the vanilla fallback all-zero UUID.
-         */
-        private static void movePlayerToPlayerData(Path worldDir, CompoundTag data, int currentVersion) throws IOException {
-                CompoundTag player = data.getCompoundOrEmpty("Player");
-                if (player.isEmpty()) {
-                        return;
-                }
-
-                CompoundTag upgraded;
-                try {
-                        int playerVersion = NbtUtils.getDataVersion(player, -1);
-                        upgraded = DataFixTypes.PLAYER.update(DataFixers.getDataFixer(), player, playerVersion, currentVersion);
-                } catch (RuntimeException e) {
-                        LegacyWorldFix.LOGGER.warn(
-                                "[LegacyWorldFix] Could not upgrade the level.dat player in place ({}); it stays in level.dat",
-                                e.toString()
-                        );
-                        return;
-                }
-
-                java.util.UUID uuid = new java.util.UUID(0L, 0L);
-                int[] rawUuid = upgraded.getIntArray("UUID").orElse(null);
-                if (rawUuid != null && rawUuid.length == 4) {
-                        uuid = net.minecraft.core.UUIDUtil.uuidFromIntArray(rawUuid);
-                }
-
-                Path playerFile = StorageLayout.playerDataDir(worldDir).resolve(uuid + ".dat");
-                Files.createDirectories(playerFile.getParent());
-                NbtUtils.addDataVersion(upgraded, currentVersion);
-                NbtIo.writeCompressed(upgraded, playerFile);
-
-                data.remove("Player");
-                data.putIntArray("singleplayer_uuid", net.minecraft.core.UUIDUtil.uuidToIntArray(uuid));
         }
 
         /**

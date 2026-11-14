@@ -9,6 +9,33 @@ Il restaure les conversions **pré-Anvil** que Mojang a retirées du jeu à part
 série 26.x, et remet ainsi les mondes de **Minecraft 1.0 (novembre 2011)** — et de toute la
 zone McRegion (Beta 1.3 → 1.1.2) — sur les rails de mise à jour officielles, jusqu'à la 26.3.
 
+**Nouveau dans la 1.8.1 — les données joueur sont restaurées (inventaire, position, XP, coffre ender)** :
+
+- **le vrai bug** : depuis la 1.21.5 le jeu lit les fichiers joueur dans `players/data/<uuid>.dat`,
+  mais le mod écrivait le joueur extrait de `level.dat` dans `playerdata/` — un dossier que la
+  26.3 n'ouvre jamais. Résultat : le monde se chargeait parfaitement, mais le jeu ne trouvait
+  aucun fichier joueur → nouveau joueur, inventaire vide, retour au spawn. Le contenu était
+  correct, il était juste au mauvais endroit ;
+- le dossier joueur est désormais lu directement depuis la constante du jeu en cours
+  (`LevelResource.PLAYER_DATA_DIR` → `players/data/`), donc il suit le jeu quelle que soit
+  la version ;
+- **fichiers joueurs par pseudo (`players/<pseudo>.dat`, ère Bêta 1.8 → 1.7.6)** : la 26.3 a
+  perdu tout repli vers ces fichiers — ils sont migrés vers `players/data/<uuid-hors-ligne>.dat`
+  (chaîne de datafixers PLAYER appliquée, ids d'items renommés) au lieu de rester ignorés à
+  jamais ;
+- **réparation automatique des mondes convertis par ≤ 1.8.0** : au prochain lancement, le
+  fichier joueur coincé dans `playerdata/` est replacé dans `players/data/` (bref écran de
+  conversion, simple déplacement de dossier), le joueur éventuellement encore coincé dans
+  `level.dat` est extrait, et `singleplayer_uuid` est complété si absent — c'est la clé que
+  `PlayerList#loadPlayerData` résout pour retrouver le joueur du solo ;
+- **ordre vanilla respecté** : le joueur quitte `level.dat` AVANT la chaîne LEVEL (ordre du
+  `LevelDatToSavedDataFileFix` vanilla) ; la convergence de la chaîne PLAYER est prouvée
+  (sortie identique sur tag brut et tag déjà corrigé) — voir `docs/PLAYER-PROOF-1.8.1.txt` ;
+- sens de migration des dossiers joueurs corrigé dans le même mouvement :
+  `playerdata/` → `players/data/`, `advancements/` → `players/advancements/`,
+  `stats/` → `players/stats/` (sens du `PlayerStorageFileFix` vanilla), et détection
+  convergente (plus d'écran de conversion superflu après réparation).
+
 **Nouveau dans la 1.8.0 — la conversion se fait quand tu lances le monde, plus au chargement de la liste** :
 
 - avant : la conversion tournait pendant le chargement de la liste des mondes — l'écran
@@ -269,7 +296,7 @@ du chemin « schéma 99 », le monde est jouable tel quel.
 ## Installation
 
 1. Installe Fabric Loader 0.20.1 ou plus récent pour Minecraft 26.3.
-2. Dépose `legacyworldfix-1.8.0+mc26.3.jar` dans le dossier `mods/`.
+2. Dépose `legacyworldfix-1.8.1+mc26.3.jar` dans le dossier `mods/`.
 3. Lance le jeu (client) ou le serveur. Aucune configuration.
 
 ### Utilisation (client)
@@ -290,9 +317,11 @@ world`, le monde est prêt dès le `Done`.
 - **Minecraft Classic pré-Indev (c0.0.x)** : les niveaux dont `Blocks` est un tableau
   d'`int` sont gérés en mode best-effort, mais le launcher et la structure des sauvegardes
   de cette époque (fichiers `.mclevel` hors dossier `saves/`) n'ont jamais été testés.
-- **Fichiers joueurs anciens (`players/<pseudo>.dat`, ère multi Bêta)** : seuls le joueur
-  de `level.dat` (mono) et les joueurs avec UUID sont replacés dans `players/data/` ; les
-  fichiers de l'ère Bêta sans UUID réapparaissent en spawn.
+- **Fichiers joueurs anciens (`players/<pseudo>.dat`, ère multi Bêta)** : migrés depuis la
+  1.8.1 vers `players/data/<uuid-hors-ligne>.dat` (uuid déterministe `OfflinePlayer:<pseudo>`).
+  Le joueur du solo retrouve toujours ses données via `singleplayer_uuid` ; un monde ayant
+  servi en LAN retrouve chaque profil sur son uuid hors-ligne (un profil en mode en-ligne
+  avec un autre uuid repartrait en spawn, ses données restant migrées sur disque).
 - **Éclairage des mondes Indev** : la lumière du ciel est approximée à la conversion puis
   recalculée par le moteur de lumière moderne au chargement.
 - Les mondes Anvil sans `DataVersion` (1.2 → 1.8) n'ont même pas besoin du mod : la 26.3

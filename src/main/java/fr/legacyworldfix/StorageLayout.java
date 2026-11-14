@@ -86,51 +86,66 @@ final class StorageLayout {
                 return worldDir.resolve("dimensions").resolve("minecraft").resolve("overworld");
         }
 
-        /** Folder where the running game reads player files ({@code <uuid>.dat}). */
+        /**
+         * Folder where the running game reads player files ({@code <uuid>.dat}).
+         * Resolved from the running build's own {@code LevelResource.PLAYER_DATA_DIR}
+         * constant - the game moved this folder more than once across releases
+         * ({@code playerdata} -> {@code players/data} in 1.21.5) and both spots have
+         * coexisted with the per-dimension chunk layout, so the two layouts must
+         * never be coupled: this build reads {@code players/data} while still
+         * reading chunks from {@code dimensions/minecraft/<dimension>/}.
+         */
         static Path playerDataDir(Path worldDir) {
-                if (!PER_DIMENSION) {
-                        return worldDir.resolve("players").resolve("data");
-                }
-                return worldDir.resolve("playerdata");
+                return worldDir.resolve(net.minecraft.world.level.storage.LevelResource.PLAYER_DATA_DIR.id());
         }
 
         /**
-         * Moves a world an older mod/game pair already converted (old layout,
-         * level.dat stamped) into the per-dimension layout, mirroring exactly
-         * what vanilla's own {@code DimensionStorageFileFix} would move - but
-         * deterministically, without depending on the vanilla upgrade pass that
-         * the DataVersion stamps skip. Idempotent: every move only happens when
-         * its source exists, carries region files and its target does not exist
-         * yet (a target that already exists means the game itself has been
-         * running in the new layout, and its data wins).
+         * Moves a world an older mod/game pair already converted into the
+         * layout this build reads, mirroring exactly what vanilla's own file
+         * fixes would move - but deterministically, without depending on the
+         * vanilla upgrade pass that the DataVersion stamps skip:
+         *
+         * <ul>
+         *   <li>chunks into the per-dimension layout, like {@code
+         *       DimensionStorageFileFix} does on builds that read it;</li>
+         *   <li>player folders into the {@code players/...} layout, like
+         *       {@code PlayerStorageFileFix} does ({@code playerdata} -&gt;
+         *       {@code players/data}, plus advancements/stats - mod 1.8.0 and
+         *       older wrote extracted players to {@code playerdata}, which
+         *       this build ignores entirely).</li>
+         * </ul>
+         *
+         * <p>Idempotent: every move only happens when its source exists and
+         * its target does not (a target that already exists means the game
+         * itself has been writing there, and its data wins). A folder move
+         * falls back to per-file moves when the target already exists.
          *
          * @return true when at least one folder was moved
          */
         static boolean migrateToPerDimensionLayoutIfNeeded(Path worldDir) throws IOException {
-                if (!PER_DIMENSION) {
-                        return false;
-                }
                 if (!isConvertedAnvilWorld(worldDir)) {
                         return false;
                 }
 
                 boolean moved = false;
-                moved |= moveRegionDir(worldDir.resolve("region"), worldDir.resolve("dimensions").resolve("minecraft").resolve("overworld").resolve("region"));
-                moved |= moveRegionDir(worldDir.resolve("DIM-1").resolve("region"), worldDir.resolve("dimensions").resolve("minecraft").resolve("the_nether").resolve("region"));
-                moved |= moveRegionDir(worldDir.resolve("DIM1").resolve("region"), worldDir.resolve("dimensions").resolve("minecraft").resolve("the_end").resolve("region"));
-                // PlayerStorageFileFix moves the same way on this layout.
-                moved |= moveFolder(worldDir.resolve("players").resolve("data"), worldDir.resolve("playerdata"));
-                moved |= moveFolder(worldDir.resolve("players").resolve("advancements"), worldDir.resolve("advancements"));
-                moved |= moveFolder(worldDir.resolve("players").resolve("stats"), worldDir.resolve("stats"));
+                if (PER_DIMENSION) {
+                        moved |= moveRegionDir(worldDir.resolve("region"), worldDir.resolve("dimensions").resolve("minecraft").resolve("overworld").resolve("region"));
+                        moved |= moveRegionDir(worldDir.resolve("DIM-1").resolve("region"), worldDir.resolve("dimensions").resolve("minecraft").resolve("the_nether").resolve("region"));
+                        moved |= moveRegionDir(worldDir.resolve("DIM1").resolve("region"), worldDir.resolve("dimensions").resolve("minecraft").resolve("the_end").resolve("region"));
+                }
+                // PlayerStorageFileFix direction: playerdata -> players/data.
+                moved |= moveIntoPlayerFolder(worldDir.resolve("playerdata"), playerDataDir(worldDir));
+                moved |= moveIntoPlayerFolder(worldDir.resolve("advancements"), worldDir.resolve("players").resolve("advancements"));
+                moved |= moveIntoPlayerFolder(worldDir.resolve("stats"), worldDir.resolve("players").resolve("stats"));
 
                 if (moved) {
                         Path markerDir = worldDir.resolve("legacyworldfix");
                         Files.createDirectories(markerDir);
-                        Files.writeString(markerDir.resolve("migrated-to-dimension-layout.txt"),
-                                "Chunk/player folders moved into the per-dimension layout (dimensions/minecraft/<dimension>) by LegacyWorldFix\n"
+                        Files.writeString(markerDir.resolve("migrated-storage-layout.txt"),
+                                "Chunk/player folders moved into the layout the running build reads by LegacyWorldFix\n"
                                 + "Date: " + java.time.Instant.now() + "\n");
                         LegacyWorldFix.LOGGER.info(
-                                "[LegacyWorldFix] World {} uses the current per-dimension storage layout - converted folders moved accordingly",
+                                "[LegacyWorldFix] World {} uses a previous storage layout - folders moved accordingly",
                                 worldDir);
                 }
                 return moved;
@@ -162,29 +177,68 @@ final class StorageLayout {
          * without writing anything.
          */
         static boolean needsPerDimensionMigration(Path worldDir) {
-                if (!PER_DIMENSION) {
-                        return false;
-                }
                 try {
                         if (!isConvertedAnvilWorld(worldDir)) {
                                 return false;
                         }
-                        if (hasRegionFiles(worldDir.resolve("region"), "*.mca")
-                                && !Files.exists(worldDir.resolve("dimensions").resolve("minecraft").resolve("overworld").resolve("region"))) {
-                                return true;
+                        if (PER_DIMENSION) {
+                                if (hasRegionFiles(worldDir.resolve("region"), "*.mca")
+                                        && !Files.exists(worldDir.resolve("dimensions").resolve("minecraft").resolve("overworld").resolve("region"))) {
+                                        return true;
+                                }
+                                if (hasRegionFiles(worldDir.resolve("DIM-1").resolve("region"), "*.mca")
+                                        && !Files.exists(worldDir.resolve("dimensions").resolve("minecraft").resolve("the_nether").resolve("region"))) {
+                                        return true;
+                                }
+                                if (hasRegionFiles(worldDir.resolve("DIM1").resolve("region"), "*.mca")
+                                        && !Files.exists(worldDir.resolve("dimensions").resolve("minecraft").resolve("the_end").resolve("region"))) {
+                                        return true;
+                                }
                         }
-                        if (hasRegionFiles(worldDir.resolve("DIM-1").resolve("region"), "*.mca")
-                                && !Files.exists(worldDir.resolve("dimensions").resolve("minecraft").resolve("the_nether").resolve("region"))) {
-                                return true;
-                        }
-                        if (hasRegionFiles(worldDir.resolve("DIM1").resolve("region"), "*.mca")
-                                && !Files.exists(worldDir.resolve("dimensions").resolve("minecraft").resolve("the_end").resolve("region"))) {
-                                return true;
-                        }
-                        return Files.isDirectory(worldDir.resolve("players").resolve("data"))
-                                && !Files.exists(worldDir.resolve("playerdata"));
+                        // PlayerStorageFileFix direction: a playerdata folder this
+                        // build no longer reads means the extracted players are invisible.
+                        return Files.isDirectory(worldDir.resolve("playerdata"))
+                                && !Files.exists(playerDataDir(worldDir));
                 } catch (IOException e) {
                         return false;
+                }
+        }
+
+        /**
+         * Moves every file of a legacy player folder into its target under
+         * {@code players/} - the whole-folder move first, per-file moves when
+         * the target already exists (game-written files there win).
+         */
+        private static boolean moveIntoPlayerFolder(Path source, Path target) throws IOException {
+                if (!Files.isDirectory(source) || Files.exists(target)) {
+                        // Whole-folder move impossible; still merge the files across.
+                        if (!Files.isDirectory(source) || !Files.isDirectory(target)) {
+                                return false;
+                        }
+                        boolean moved = false;
+                        try (DirectoryStream<Path> files = Files.newDirectoryStream(source, "*.dat")) {
+                                for (Path file : files) {
+                                        Path destination = target.resolve(file.getFileName().toString());
+                                        if (!Files.exists(destination)) {
+                                                Files.createDirectories(target);
+                                                Files.move(file, destination);
+                                                moved = true;
+                                        }
+                                }
+                        }
+                        if (moved && dirEmpty(source)) {
+                                Files.deleteIfExists(source);
+                        }
+                        return moved;
+                }
+                Files.createDirectories(target.getParent());
+                Files.move(source, target);
+                return true;
+        }
+
+        private static boolean dirEmpty(Path dir) throws IOException {
+                try (DirectoryStream<Path> stream = Files.newDirectoryStream(dir)) {
+                        return !stream.iterator().hasNext();
                 }
         }
 
