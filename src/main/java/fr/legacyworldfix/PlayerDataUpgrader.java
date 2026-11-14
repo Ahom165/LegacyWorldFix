@@ -72,6 +72,16 @@ final class PlayerDataUpgrader {
                         }
                 }
 
+                // 1b. Recovery for worlds a mod release <= 1.7.0 converted and the
+                //     game then opened: those releases never extracted the level.dat
+                //     player, and the 26.x level.dat writer never serializes the
+                //     embedded Player tag - the first in-game save destroyed it.
+                //     level.dat_old (one save back: the level.dat this mod wrote,
+                //     where the conversion kept the player) is then the only copy.
+                if (!data.contains("Player") && recoverPlayerFromLevelDatBackup(worldDir, data)) {
+                        changed = true;
+                }
+
                 // 2. Legacy name-based files the running game can no longer read.
                 int migrated = convertLegacyNameFiles(worldDir);
                 if (migrated > 0) {
@@ -120,23 +130,17 @@ final class PlayerDataUpgrader {
                 }
 
                 CompoundTag upgraded;
+                UUID uuid;
                 try {
-                        int playerVersion = NbtUtils.getDataVersion(player, -1);
-                        upgraded = playerVersion >= LegacyMcRegionUpgrader.currentDataVersion()
-                                ? player.copy()
-                                : DataFixTypes.PLAYER.update(DataFixers.getDataFixer(), player.copy(), playerVersion, LegacyMcRegionUpgrader.currentDataVersion());
+                        UpgradedPlayer result = upgradePlayerTag(player);
+                        upgraded = result.tag();
+                        uuid = result.uuid();
                 } catch (RuntimeException e) {
                         LegacyWorldFix.LOGGER.warn(
                                 "[LegacyWorldFix] Could not upgrade the level.dat player in place ({}); it stays in level.dat",
                                 e.toString()
                         );
                         return false;
-                }
-
-                UUID uuid = FALLBACK_SINGLE_PLAYER_UUID;
-                int[] rawUuid = upgraded.getIntArray("UUID").orElse(null);
-                if (rawUuid != null && rawUuid.length == 4) {
-                        uuid = UUIDUtil.uuidFromIntArray(rawUuid);
                 }
 
                 Path playerFile = StorageLayout.playerDataDir(worldDir).resolve(uuid + ".dat");
@@ -154,6 +158,107 @@ final class PlayerDataUpgrader {
                         playerFile
                 );
                 return true;
+        }
+
+        /**
+         * Last-resort recovery for worlds a mod release &le; 1.7.0 converted and
+         * the game then opened. Those releases never extracted the level.dat
+         * player (this class did not exist yet), and the 26.x level.dat writer
+         * never serializes the embedded {@code Player} tag - so the very first
+         * in-game save of such a world destroyed the only copy of the
+         * singleplayer player. {@code level.dat_old} still holds it: one save
+         * back it is the level.dat the conversion wrote, where the embedded
+         * player was kept (only the current level.dat gets the game's own
+         * rewrite).
+         *
+         * <p>Runs only when there is nothing better to protect: no embedded
+         * player in level.dat (checked by the caller) and no
+         * {@code singleplayer_uuid} recorded. A recorded uuid means a restore
+         * already happened or the game has been playing under that identity -
+         * overwriting that player file could drop real progress, so the backup
+         * is left alone. The recovered player goes to the tag uuid or the nil
+         * fallback, and level.dat records it, exactly like the regular
+         * extraction. The backup file itself stays untouched.
+         */
+        static boolean recoverPlayerFromLevelDatBackup(Path worldDir, CompoundTag data) throws IOException {
+                if (data.getIntArray("singleplayer_uuid").orElse(null) != null) {
+                        return false;
+                }
+
+                Path backup = worldDir.resolve("level.dat_old");
+                if (!Files.isRegularFile(backup)) {
+                        return false;
+                }
+
+                CompoundTag player;
+                try {
+                        CompoundTag backupRoot = NbtIo.readCompressed(backup, NbtAccounter.unlimitedHeap());
+                        player = backupRoot.getCompoundOrEmpty("Data").getCompoundOrEmpty("Player");
+                } catch (IOException | RuntimeException e) {
+                        LegacyWorldFix.LOGGER.warn(
+                                "[LegacyWorldFix] Could not read the player backup {} ({}); skipping recovery",
+                                backup,
+                                e.toString()
+                        );
+                        return false;
+                }
+                if (player.isEmpty()) {
+                        return false;
+                }
+
+                CompoundTag upgraded;
+                UUID uuid;
+                try {
+                        UpgradedPlayer result = upgradePlayerTag(player);
+                        upgraded = result.tag();
+                        uuid = result.uuid();
+                } catch (RuntimeException e) {
+                        LegacyWorldFix.LOGGER.warn(
+                                "[LegacyWorldFix] Could not upgrade the level.dat_old player of {} ({}); it stays in the backup",
+                                worldDir.getFileName(),
+                                e.toString()
+                        );
+                        return false;
+                }
+
+                Path playerFile = StorageLayout.playerDataDir(worldDir).resolve(uuid + ".dat");
+                if (!Files.isRegularFile(playerFile)) {
+                        Files.createDirectories(playerFile.getParent());
+                        NbtUtils.addDataVersion(upgraded, LegacyMcRegionUpgrader.currentDataVersion());
+                        NbtIo.writeCompressed(upgraded, playerFile);
+                }
+
+                data.putIntArray("singleplayer_uuid", UUIDUtil.uuidToIntArray(uuid));
+                LegacyWorldFix.LOGGER.warn(
+                        "[LegacyWorldFix] Recovered the singleplayer player of {} from level.dat_old (an earlier "
+                                + "in-game session had destroyed the embedded copy): {}",
+                        worldDir.getFileName(),
+                        playerFile
+                );
+                return true;
+        }
+
+        /** A player tag run through the PLAYER datafixer chain, with its resolved uuid. */
+        private record UpgradedPlayer(CompoundTag tag, UUID uuid) {
+        }
+
+        /**
+         * PLAYER datafixer chain from the tag's own version (missing counts as
+         * the oldest schema - the DFU clamps) plus the tag uuid, falling back
+         * to the nil uuid every pre-1.8 save carries none.
+         */
+        private static UpgradedPlayer upgradePlayerTag(CompoundTag player) {
+                int playerVersion = NbtUtils.getDataVersion(player, -1);
+                CompoundTag upgraded = playerVersion >= LegacyMcRegionUpgrader.currentDataVersion()
+                        ? player.copy()
+                        : DataFixTypes.PLAYER.update(DataFixers.getDataFixer(), player.copy(), playerVersion, LegacyMcRegionUpgrader.currentDataVersion());
+
+                UUID uuid = FALLBACK_SINGLE_PLAYER_UUID;
+                int[] rawUuid = upgraded.getIntArray("UUID").orElse(null);
+                if (rawUuid != null && rawUuid.length == 4) {
+                        uuid = UUIDUtil.uuidFromIntArray(rawUuid);
+                }
+                return new UpgradedPlayer(upgraded, uuid);
         }
 
         /**

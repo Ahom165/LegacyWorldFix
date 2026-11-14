@@ -185,15 +185,22 @@ public final class LegacyMcRegionUpgrader {
         /**
          * Cheap level.dat / directory-shape check for player data the running
          * build would silently ignore: the singleplayer player still embedded
-         * in level.dat (26.x reads players only from their own files), or
-         * name-based {@code players/<name>.dat} files (the name-based fallback
-         * was removed) that have no migrated counterpart under the player data
+         * in level.dat (26.x reads players only from their own files), a
+         * player recoverable from {@code level.dat_old} (worlds a mod release
+         * &le; 1.7.0 converted and the game then opened - the game's level.dat
+         * writer dropped the embedded player on its first save, and the backup
+         * written by the conversion still holds it), or name-based
+         * {@code players/<name>.dat} files (the name-based fallback was
+         * removed) that have no migrated counterpart under the player data
          * folder yet. Converges to false once {@code PlayerDataUpgrader} ran.
          */
         private static boolean needsPlayerRepair(Path worldDir) {
                 try {
                         CompoundTag root = NbtIo.readCompressed(worldDir.resolve("level.dat"), NbtAccounter.unlimitedHeap());
                         if (!root.getCompoundOrEmpty("Data").getCompoundOrEmpty("Player").isEmpty()) {
+                                return true;
+                        }
+                        if (isRecoverableBackupPlayer(worldDir, root.getCompoundOrEmpty("Data"))) {
                                 return true;
                         }
                         Path playersDir = worldDir.resolve("players");
@@ -215,7 +222,90 @@ public final class LegacyMcRegionUpgrader {
                                         }
                                 }
                         }
+                        warnIfPlayerDataDestroyed(worldDir, root.getCompoundOrEmpty("Data"), playersDir, dataDir);
                         return false;
+                } catch (IOException | RuntimeException e) {
+                        return false;
+                }
+        }
+
+        /**
+         * One-shot heads-up for the worst case: a world this mod already
+         * converted (DataVersion stamped) whose singleplayer player is gone
+         * from level.dat, absent from level.dat_old (more than one in-game
+         * save since the conversion - the 26.x level.dat writer never
+         * serializes the embedded player), with no player file anywhere.
+         * Nothing is recoverable and the game will spawn a fresh player; the
+         * log and the marker file under {@code legacyworldfix/} say so once
+         * instead of failing silently. Never triggers work: returns void and
+         * the caller still returns false.
+         */
+        private static void warnIfPlayerDataDestroyed(Path worldDir, CompoundTag data, Path playersDir, Path dataDir) {
+                try {
+                        if (data.getIntOr("DataVersion", -1) < CURRENT_DATA_VERSION
+                                || data.contains("Player")
+                                || data.getIntArray("singleplayer_uuid").orElse(null) != null) {
+                                return;
+                        }
+                        Path marker = worldDir.resolve("legacyworldfix").resolve("player-data-destroyed.txt");
+                        if (Files.isRegularFile(marker)) {
+                                return;
+                        }
+                        if (hasAnyPlayerFile(playersDir) || hasAnyPlayerFile(dataDir)) {
+                                return;
+                        }
+                        Files.createDirectories(marker.getParent());
+                        Files.writeString(marker, """
+                                The singleplayer player of this world could not be found anywhere:
+                                not in level.dat, not in level.dat_old, no player files either.
+                                If this world was converted by LegacyWorldFix 1.7.0 or older and then
+                                opened in the game, the first in-game save overwrote the embedded
+                                player (the game's level.dat writer never keeps it) and a second save
+                                overwrote the level.dat_old backup.
+                                The original inventory / position can only come from a backup copy of
+                                the world made before that happened.""");
+                        LegacyWorldFix.LOGGER.warn(
+                                "[LegacyWorldFix] No singleplayer player data found in {} (level.dat, level.dat_old, "
+                                        + "playerdata/ and players/ all checked) - see {} for details",
+                                worldDir.getFileName(),
+                                marker
+                        );
+                } catch (IOException | RuntimeException e) {
+                        // best effort only
+                }
+        }
+
+        /** True when the folder exists and holds at least one {@code *.dat} file. */
+        private static boolean hasAnyPlayerFile(Path dir) throws IOException {
+                if (!Files.isDirectory(dir)) {
+                        return false;
+                }
+                try (DirectoryStream<Path> stream = Files.newDirectoryStream(dir, "*.dat")) {
+                        return stream.iterator().hasNext();
+                }
+        }
+
+        /**
+         * True when {@code level.dat} carries no player and no recorded
+         * singleplayer uuid, but {@code level.dat_old} does - a world a mod
+         * release &le; 1.7.0 converted and the game then opened at least once
+         * (the 26.x level.dat writer never serializes the embedded player, so
+         * the first in-game save destroyed it; the backup still holds the
+         * copy). Mirrors {@link PlayerDataUpgrader#recoverPlayerFromLevelDatBackup},
+         * which refuses to run once a uuid is recorded (that means a restore
+         * already happened or the game has been playing - real progress).
+         */
+        private static boolean isRecoverableBackupPlayer(Path worldDir, CompoundTag data) {
+                if (data.getIntArray("singleplayer_uuid").orElse(null) != null) {
+                        return false;
+                }
+                Path backup = worldDir.resolve("level.dat_old");
+                if (!Files.isRegularFile(backup)) {
+                        return false;
+                }
+                try {
+                        CompoundTag backupRoot = NbtIo.readCompressed(backup, NbtAccounter.unlimitedHeap());
+                        return !backupRoot.getCompoundOrEmpty("Data").getCompoundOrEmpty("Player").isEmpty();
                 } catch (IOException | RuntimeException e) {
                         return false;
                 }

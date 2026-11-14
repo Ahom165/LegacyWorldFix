@@ -1,0 +1,100 @@
+PROOF — Player recovery from level.dat_old (LegacyWorldFix 1.8.2, Minecraft 26.3)
+==================================================================================
+
+SYMPTOM REPORTED
+----------------
+"ça marche tj pas (je teste avec un monde a1.2)" - with mod 1.8.1 installed,
+an Alpha 1.2 world still opens with a fresh player (empty inventory, spawn
+position), while the same release restored the player of the Beta world.
+
+WHAT WAS RULED OUT (all verified this session, before the fix)
+--------------------------------------------------------------
+1. Detection: an Alpha 1.2 world (no "version" tag in level.dat, loose
+   c.<x>.<z>.dat chunk files, DIM-1 from the Halloween update) is detected
+   PRE_REGION and converted. Harness: LaunchFlowProbe on a realistic a1.2
+   world (era-shaped player: short Health, byte Count, short ids, armor in
+   slot 103) + a DIM-1 nether (nested-Level and flat-root chunks):
+   7/7 chunks converted, nether regions land in
+   dimensions/minecraft/the_nether/region (StorageLayout.regionDir), PROBE OK.
+2. Extraction: the embedded player leaves level.dat through the PLAYER chain
+   (version -1, the DFU clamps to the oldest schema), lands in
+   players/data/<nil-uuid>.dat with namespaced items
+   (minecraft:diamond_pickaxe + components, armor migrated to "equipment"),
+   singleplayer_uuid recorded. Verified by file inspection.
+3. Vanilla legs, run with the REAL 26.3 classes (VanillaPlayerLoadProbe):
+   - PrimaryLevelData.parse reads "singleplayer_uuid" -> getSinglePlayerUUID()
+     = 00000000-0000-0000-0000-000000000000 (not null);
+   - PlayerDataStorage.load(new NameAndId(nil, "<singleplayer owner>")) finds
+     the extracted file: Pos=[8.5,6.0,8.5], inventory 3 + equipment 1,
+     DataVersion 5023.
+   -> "VANILLA PLAYER LOAD LEGS OK". The game-side load path cannot fail on
+   a 1.8.1-converted world whose player tag survived.
+4. Filefixer: FileFixerUpper.worldVersionToFileFixerVersion(5023) = 5023 ->
+   requiresFileFixing(5023) = false (latest = 5023). The vanilla upgrade pass
+   never runs on a stamped world; it cannot undo the player setup either.
+
+ROOT CAUSE — the state the user's world folder is actually in
+-------------------------------------------------------------
+Mod releases <= 1.7.0 never extracted the level.dat player (PlayerDataUpgrader
+did not exist yet): their patchLevelDat ran the LEVEL chain with the player
+still inside and stamped DataVersion=5023. Opening such a world spawns a fresh
+player (no player file exists), and the FIRST IN-GAME SAVE destroys the
+embedded player: the 26.x level.dat writer (PrimaryLevelData#writeDataProperties,
+disassembled) serializes Time/spawn/difficulty_settings/singleplayer_uuid/...
+and never the Player tag. After that save:
+  - level.dat      = game-written, no Player, no singleplayer_uuid
+  - level.dat_old  = one save back = the level.dat the <=1.7.0 conversion
+                     wrote - STILL HOLDING THE ORIGINAL PLAYER
+After a SECOND save, level.dat_old is a game-written copy too: nothing left.
+1.8.1 had no recovery for any of this: repairWorld only handled the
+player-in-level.dat and playerdata/ cases, so the a1.2 world (converted
+earlier, opened earlier) stayed broken on every launch. Alpha 1.2 makes it
+obvious only because that is the world the user tests with.
+
+FIX (1.8.2)
+-----------
+- PlayerDataUpgrader.recoverPlayerFromLevelDatBackup: when level.dat carries
+  no player and no singleplayer_uuid, and level.dat_old still holds
+  Data.Player, the backup player runs through the PLAYER chain (convergent,
+  same proof as 1.8.1) into players/data/<uuid>.dat (nil fallback), and
+  level.dat records singleplayer_uuid. The backup file itself is untouched.
+- Guard: the recovery refuses to run once singleplayer_uuid is recorded -
+  a recorded uuid means a restore already happened or the game has played
+  under that identity; overwriting that file could drop real progress.
+- LegacyMcRegionUpgrader.needsPlayerRepair detects the recoverable case
+  (isRecoverableBackupPlayer) so the launch flow actually runs it; converges
+  to false once repaired (no repeated conversion screens).
+- The hopeless case (nothing anywhere) gets a one-shot honest marker:
+  legacyworldfix/player-data-destroyed.txt + a single log warning, instead
+  of silently spawning a fresh player forever.
+
+PROBE — PlayerRepairProbe (40/40 checks)
+----------------------------------------
+Worlds A-C (1.8.1 regressions): unchanged, all pass.
+World D - converted by <=1.7.0, then opened once (level.dat game-written,
+          level.dat_old still holding the raw player, plus the fresh
+          game-written players/data/<real-uuid>.dat):
+  OK   D: needsLayoutMigration true before
+  OK   D: original player recovered from level.dat_old
+  OK   D: recovered inventory namespaced (minecraft:stone)
+  OK   D: recovered file stamped with DataVersion 5023
+  OK   D: singleplayer_uuid = nil uuid (the original wins over the fresh file)
+  OK   D: game-written player file left untouched
+  OK   D: level.dat_old left untouched (still the last-resort copy)
+  OK   D: needsLayoutMigration false after (convergent, 2 runs)
+World E - opened twice, nothing left anywhere:
+  OK   E: needsLayoutMigration false (no pointless conversion screen)
+  OK   E: no fabricated player file
+  OK   E: one-shot warning + legacyworldfix/player-data-destroyed.txt written
+  ALL PLAYER REPAIR CHECKS PASSED
+
+Regression: LaunchFlowProbe on the realistic a1.2 world + DIM-1 nether:
+PROBE OK (7/7 chunks, nether at dimensions/minecraft/the_nether/region).
+
+GAME-SIDE EFFECT (what the player sees)
+---------------------------------------
+Opening the a1.2 world with 1.8.2 shows the conversion screen for a moment
+(extraction, pure NBT work), then the world opens with the original
+inventory / position / XP restored from level.dat_old. If nothing is
+recoverable, the world opens with a fresh player and the marker file + log
+explain exactly why and what the only remaining option is (a world backup).

@@ -9,6 +9,31 @@ Il restaure les conversions **pré-Anvil** que Mojang a retirées du jeu à part
 série 26.x, et remet ainsi les mondes de **Minecraft 1.0 (novembre 2011)** — et de toute la
 zone McRegion (Beta 1.3 → 1.1.2) — sur les rails de mise à jour officielles, jusqu'à la 26.3.
 
+**Nouveau dans la 1.8.2 — récupération des joueurs détruits par les anciennes versions du mod (mondes a1.2 / Alpha, et tous les autres)** :
+
+- **le vrai scénario** : un monde converti par une version ≤ 1.7.0 puis **ouvert en jeu** au moins
+  une fois perdait son joueur au premier enregistrement — la 26.x n'écrit jamais le joueur
+  embarqué dans `level.dat`, donc la partie l'a écrasé. Résultat : ouverture normale, mais
+  inventaire vide et retour au spawn, quelle que soit la version du mod ensuite (« ça marche
+  toujours pas, je teste avec un monde a1.2 ») ;
+- **la récupération** : au lancement du monde, le mod trouve maintenant le joueur original dans
+  `level.dat_old` — une sauvegarde en arrière, c'est le `level.dat` que la conversion avait
+  écrit, et le jeu ne le réécrit pas — le sort vers `players/data/<uuid>.dat` (chaîne PLAYER
+  appliquée, items renommés) et enregistre `singleplayer_uuid`. L'écran de conversion s'affiche
+  brièvement, puis le monde s'ouvre avec l'inventaire et la position d'origine ;
+- **garde-fou** : la récupération ne s'exécute que si aucun `singleplayer_uuid` n'est déjà
+  enregistré — si une restauration a déjà eu lieu ou si le jeu a déjà joué sous une identité,
+  le fichier joueur existant gagne (jamais d'écrasement de progression réelle) ;
+- **cas désespéré, dit franchement** : si le monde a été ouvert deux fois ou plus après la
+  conversion, `level.dat_old` contient aussi un `level.dat` du jeu et plus aucune copie du
+  joueur n'existe. Le mod écrit alors une marque `legacyworldfix/player-data-destroyed.txt`
+  dans le monde + un avertissement dans les logs (une seule fois), au lieu d'échouer en
+  silence ; seule une sauvegarde du monde peut redonner les données d'origine ;
+- vérifié de bout en bout : harnais de réparation 40/40 (mondes A-E, dont les deux nouveaux),
+  conversion Alpha 1.2 + Nether (DIM-1) complète, et **chargement du joueur prouvé avec le
+  vrai code du jeu** (`PrimaryLevelData.parse` lit `singleplayer_uuid`, `PlayerDataStorage.load`
+  retrouve le fichier extrait avec Pos + inventaire + équipement).
+
 **Nouveau dans la 1.8.1 — les données joueur sont restaurées (inventaire, position, XP, coffre ender)** :
 
 - **le vrai bug** : depuis la 1.21.5 le jeu lit les fichiers joueur dans `players/data/<uuid>.dat`,
@@ -296,7 +321,7 @@ du chemin « schéma 99 », le monde est jouable tel quel.
 ## Installation
 
 1. Installe Fabric Loader 0.20.1 ou plus récent pour Minecraft 26.3.
-2. Dépose `legacyworldfix-1.8.1+mc26.3.jar` dans le dossier `mods/`.
+2. Dépose `legacyworldfix-1.8.2+mc26.3.jar` dans le dossier `mods/`.
 3. Lance le jeu (client) ou le serveur. Aucune configuration.
 
 ### Utilisation (client)
