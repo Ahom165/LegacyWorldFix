@@ -1,6 +1,5 @@
 package fr.legacyworldfix;
 
-import java.io.BufferedInputStream;
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.Closeable;
@@ -14,10 +13,10 @@ import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.zip.DataFormatException;
 import java.util.zip.Deflater;
-import java.util.zip.DeflaterOutputStream;
 import java.util.zip.GZIPInputStream;
-import java.util.zip.InflaterInputStream;
+import java.util.zip.Inflater;
 import net.minecraft.nbt.CompoundTag;
 import net.minecraft.nbt.NbtAccounter;
 import net.minecraft.nbt.NbtIo;
@@ -28,6 +27,14 @@ import net.minecraft.nbt.NbtIo;
  * chunk locations and 1024 timestamps, followed by 4 KiB sectors of chunk
  * payloads. Chunk payloads are NBT, gzip or zlib compressed in McRegion
  * files; we always write zlib like modern versions do.
+ *
+ * <p>The v1.7.0 codec is one-shot and pooled: each worker thread owns an
+ * {@link Inflater}/{@link Deflater} pair plus a 64 KiB scratch buffer
+ * (ThreadLocal, reset per use), and every payload is inflated or deflated
+ * straight from/to its byte array. The previous shape paid a fresh native
+ * z_stream per chunk and pulled compressed bytes through an
+ * {@code InflaterInputStream} with the 512-byte default buffer (~100 refills
+ * per chunk, each a virtual-call round trip).
  */
 final class RegionIo {
 
@@ -147,16 +154,70 @@ final class RegionIo {
 
         /** Inflates and parses one raw chunk payload. */
         static CompoundTag decodeChunk(RawChunk raw) throws IOException {
-                InputStream stream = switch (raw.compressionType()) {
-                        case COMPRESSION_GZIP -> new GZIPInputStream(new ByteArrayInputStream(raw.data()), GZIP_BUFFER);
-                        case COMPRESSION_ZLIB -> new InflaterInputStream(new ByteArrayInputStream(raw.data()));
-                        case COMPRESSION_NONE -> new ByteArrayInputStream(raw.data());
+                return switch (raw.compressionType()) {
+                        case COMPRESSION_GZIP -> readNbt(gunzip(raw.data()));
+                        case COMPRESSION_ZLIB -> readNbt(inflate(raw.data(), 0, raw.data().length, INFLATER_ZLIB.get()));
+                        case COMPRESSION_NONE -> readNbt(raw.data());
                         default -> throw new IOException("Unknown chunk compression " + raw.compressionType());
                 };
+        }
 
-                try (InputStream in = new BufferedInputStream(stream)) {
+        /** Parses one fully-inflated NBT payload. */
+        private static CompoundTag readNbt(byte[] bytes) throws IOException {
+                try (InputStream in = new ByteArrayInputStream(bytes)) {
                         return NbtIo.read(new DataInputStream(in), NbtAccounter.unlimitedHeap());
                 }
+        }
+
+        /**
+         * One-shot gzip inflate with a pooled engine. Old saves were written by
+         * Java's own {@code GZIPOutputStream}: a plain 10-byte header (RFC 1952,
+         * no optional fields) followed by the raw deflate stream. Anything that
+         * does not match that exact shape falls back to {@link GZIPInputStream},
+         * which knows every header variant and multi-member files.
+         */
+        private static byte[] gunzip(byte[] payload) throws IOException {
+                if (payload.length >= 18
+                        && payload[0] == (byte) 0x1f
+                        && payload[1] == (byte) 0x8b
+                        && payload[2] == 8
+                        && payload[3] == 0) {
+                        // The 8-byte CRC32+ISIZE trailer sits behind the deflate
+                        // stream; the inflater stops exactly at the stream end and
+                        // never reads it.
+                        return inflate(payload, 10, payload.length - 10, INFLATER_GZIP.get());
+                }
+                try (InputStream in = new GZIPInputStream(new ByteArrayInputStream(payload), GZIP_BUFFER)) {
+                        return in.readAllBytes();
+                }
+        }
+
+        /**
+         * Inflates {@code length} bytes at {@code offset} with the thread's pooled
+         * engine into one contiguous result. The engine is {@link Inflater#reset()
+         * reset} per call, so a payload that failed mid-stream cannot poison the
+         * next one.
+         */
+        private static byte[] inflate(byte[] payload, int offset, int length, Inflater inflater) throws IOException {
+                inflater.reset();
+                inflater.setInput(payload, offset, length);
+                ByteArrayOutputStream out = new ByteArrayOutputStream(length * 3);
+                byte[] scratch = SCRATCH.get();
+                try {
+                        while (!inflater.finished()) {
+                                int produced = inflater.inflate(scratch);
+                                if (produced == 0) {
+                                        if (inflater.needsInput() || inflater.needsDictionary()) {
+                                                throw new IOException("Truncated compressed chunk payload");
+                                        }
+                                } else {
+                                        out.write(scratch, 0, produced);
+                                }
+                        }
+                } catch (DataFormatException e) {
+                        throw new IOException("Corrupt compressed chunk payload: " + e.getMessage(), e);
+                }
+                return out.toByteArray();
         }
 
         /** Compresses a transformed chunk into its final Anvil payload. */
@@ -166,29 +227,43 @@ final class RegionIo {
 
         /** Reads a loose, gzipped NBT file (pre-region chunk files and old level.dat variants). */
         static CompoundTag readGzippedNbt(Path file) throws IOException {
-                // 64 KiB inflater buffer: the GZIP default of 512 bytes turns every
-                // ~10-50 KiB chunk file into ~20-100 refill round-trips.
-                try (InputStream in = new GZIPInputStream(new BufferedInputStream(Files.newInputStream(file)), GZIP_BUFFER)) {
-                        return NbtIo.read(new DataInputStream(in), NbtAccounter.unlimitedHeap());
-                }
+                return readNbt(gunzip(Files.readAllBytes(file)));
         }
 
+        /**
+         * Serializes a chunk to NBT and zlib-compresses it in one shot with the
+         * thread's pooled {@link Deflater} ({@link Deflater#BEST_SPEED}, exactly
+         * the parameters the per-chunk constructor used, so the bytes on disk are
+         * identical).
+         */
         static byte[] zlibNbt(CompoundTag tag) throws IOException {
-                ByteArrayOutputStream bytes = new ByteArrayOutputStream();
-                // BEST_SPEED: the mod only rewrites containers once and the game's own
-                // save pipeline recompresses on the next save anyway, so we optimize for
-                // conversion wall time rather than for file size.
-                Deflater deflater = new Deflater(Deflater.BEST_SPEED);
-                try {
-                        try (DeflaterOutputStream deflaterStream = new DeflaterOutputStream(bytes, deflater)) {
-                                NbtIo.write(tag, new DataOutputStream(deflaterStream));
-                        }
-                } finally {
-                        deflater.end();
-                }
+                ByteArrayOutputStream nbtBytes = new ByteArrayOutputStream(1 << 16);
+                NbtIo.write(tag, new DataOutputStream(nbtBytes));
+                byte[] plain = nbtBytes.toByteArray();
 
-                return bytes.toByteArray();
+                Deflater deflater = DEFLATER.get();
+                deflater.reset();
+                deflater.setInput(plain);
+                deflater.finish();
+                ByteArrayOutputStream out = new ByteArrayOutputStream(plain.length / 2);
+                byte[] scratch = SCRATCH.get();
+                while (!deflater.finished()) {
+                        int produced = deflater.deflate(scratch);
+                        out.write(scratch, 0, produced);
+                }
+                return out.toByteArray();
         }
+
+        /**
+         * Per-thread compression engines and scratch space. The converter pool is
+         * a small fixed set of long-lived threads, so at most one engine pair per
+         * thread exists for the whole process; reset() between uses keeps a
+         * failed payload from corrupting the next.
+         */
+        private static final ThreadLocal<Inflater> INFLATER_ZLIB = ThreadLocal.withInitial(() -> new Inflater(false));
+        private static final ThreadLocal<Inflater> INFLATER_GZIP = ThreadLocal.withInitial(() -> new Inflater(true));
+        private static final ThreadLocal<Deflater> DEFLATER = ThreadLocal.withInitial(() -> new Deflater(Deflater.BEST_SPEED, false));
+        private static final ThreadLocal<byte[]> SCRATCH = ThreadLocal.withInitial(() -> new byte[GZIP_BUFFER]);
 
         private static void writeInt(byte[] target, int offset, int value) {
                 target[offset] = (byte) (value >>> 24);

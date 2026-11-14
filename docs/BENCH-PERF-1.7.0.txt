@@ -1,0 +1,97 @@
+BENCHMARK PERFORMANCES - v1.7.0 (14 novembre 2026)
+====================================================
+
+Question : « vérifie le reste du dfu et fait le from scratch si besoin »
+
+Ce qui a été vérifié, réécrit de zéro, mesuré, prouvé
+-----------------------------------------------------
+Banc : BenchDfu hors-jeu (classpath deobf 26.3 + DFU 10.0.21), CPU 2 coeurs.
+Preuve d'identité : le code v1.6.0 est embarqué tel quel dans le banc
+(oldTransformChunkNbt / oldDecodeZlib / oldDecodeGzip / oldZlibNbt) et chaque
+étape du nouveau pipeline est comparée STRICTEMENT à l'ancien sur 61 chunks
+(terrain plein, terrain réduit/agrandi, chunk tout-air).
+
+1. REECRITURE FROM SCRATCH DU CODEC (RegionIo) - GARDÉ
+   Avant : InflaterInputStream avec son buffer par défaut de 512 octets côté
+   zlib (branche McRegion - le correctif 64 KiB de la 1.6.0 n'avait touché que
+   la lecture gzip), GZIPInputStream reconstruit par fichier, Deflater natif
+   neuf + DeflaterOutputStream + DataOutputStream par chunk.
+   Après : moteurs Inflater/Deflater poolés par thread (reset à chaque usage),
+   inflate one-shot plein buffer depuis le tableau d'octets exact, entête gzip
+   RFC 1952 lu à la main (repli GZIPInputStream si non standard), déflatement
+   one-shot au niveau BEST_SPEED inchangé.
+   IDENTITE STRICTE : octets compressés identiques 61/61 (même niveau, même
+   stratégie -> même flux zlib), décodages zlib/gzip identiques 61/61.
+   MESURE : decode gzip x1,80 ; compress x1,19 ; decode zlib ~x1,0-1,2 en
+   régime établi mais stable dès la première passe (l'ancien chemin coûtait
+   0,09-0,55 ms/chunk selon la rampe JIT, le nouveau 0,088-0,092 constant).
+
+2. REECRITURE FROM SCRATCH DU RESHAPE (transformChunkNbt) - GARDÉ
+   Avant : 8 sections construites intégralement (6 Ko de copies + nibbles +
+   tags) PUIS les sections tout-air jetées par un second scan complet.
+   Après : passe unique fusionnée - la colonne source (x,z) de 16 octets est
+   contiguë, la copie la parcourt une fois en détectant le premier bloc non
+   air ; une section tout-air n'alloue RIEN (ni tableaux, ni tag, ni travail
+   des nibbles Data). Cas limite inchangé : un chunk sans terrain garde ses
+   8 sections.
+   IDENTITE STRICTE : sorties du transform identiques 61/61, sorties DFU
+   identiques 61/61.
+   MESURE : reshape 0,151 -> 0,071 ms/chunk (x2,1).
+
+3. COMPOSITION DES REGLES DFU - CACHEE EN ARRIERE-PLAN - GARDÉ (le plus gros gain visible)
+   La chaîne DFU compose ses règles paresseusement par (type, plage de
+   versions) : le PREMIER chunk payait 4,2-4,3 s de composition de règles
+   (mesuré 3 fois : 4313 / 4254 / 4183 ms) avant de convertir le moindre octet,
+   en bloquant le fil de conversion. Le warm-up d'arrière-plan construit
+   désormais les règles CHUNK + LEVEL + PLAYER avec un chunk synthétique de la
+   forme exacte que les convertisseurs alimentent, en parallèle de l'écran
+   titre / du scan de monde. Les règles composées sont gardées en cache dans le
+   DFU partagé : le premier vrai chunk arrive sur un cache chaud.
+   Log visible : « Datafixer ready in N ms (built 0 ms, rules composed N ms,
+   prebuilt in background) ».
+   MESURE réelle en jeu : le monde rootstyletest converti en 4593 ms dont
+   l'essentiel est l'attente de composition ; les mondes suivants (règles déjà
+   composées) : 154 ms et 393 ms.
+
+4. NON-MODIFIES (vérifiés, laissés tels quels)
+   - Le moteur DFU lui-même (PointFree.evalCached etc.) : code Mojang,
+     identique à l'upgrade vanilla, irréductible sans réimplémenter la chaîne.
+   - L'orchestration 3 phases (lecture séquentielle / DFU parallèle / écriture
+     parallèle) : correcte, honnête en cas d'échec, I/O ~0,4-0,9 ms/chunk -
+     une réécriture en pipeline n'apporterait rien de mesurable.
+   - GC (G1 vs Parallel) : déjà prouvé nul en 1.6.0.
+
+AUDIT FINAL DU PIPELINE (JIT chaud, 48 chunks, 2 coeurs)
+   decode zlib 0,088 | decode gzip 0,075 | reshape 0,071 | DFU 39,56 |
+   compress 0,328 | pipeline complet 40,56 ms/chunk
+   -> le coût propre du mod est passé sous la milliseconde par chunk ; le
+   moteur DFU reste LE poste (>97 %), déjà réparti sur tous les coeurs.
+
+DECOUVERTE MAJEURE EN COURS DE ROUTE (corrige en 1.7.0, hors perf)
+------------------------------------------------------------------
+Le harnais E2E ne voyait plus ses blocs marqueurs en jeu depuis la résolution
+du 14/11 du jar Minecraft 26.3 : les builds 26.x récents ont déplacé le
+stockage des chunks vers dimensions/minecraft/<dimension>/region (le move
+« region -> dimensions/minecraft/overworld/region » de DimensionStorageFileFix
+lors du pass d'upgrade vanilla), sans changer l'id « 26.3 » ni la data version
+5023. Un monde converti + estampillé DataVersion saute le pass vanilla, donc
+le jeu cherchait les chunks au nouvel emplacement, ne les trouvait pas, et
+régénérait le monde en silence.
+Correctifs 1.7.0 (voir PREUVE-TESTS-1.7.0.txt) :
+  - détection du layout à l'exécution (présence de DimensionStorageFileFix) ;
+  - les conversions écrivent dans le layout que le jeu en cours lit
+    (dimensions/minecraft/<dimension>/region + playerdata/), y compris pour
+    DIM-1/DIM1 ;
+  - migration automatique idempotente des mondes déjà convertis dans l'ancien
+    layout (region/ -> dimensions/..., players/data -> playerdata), avec
+    marqueur « migrated-to-dimension-layout.txt » - c'est le cas d'un joueur
+    qui met à jour son jeu après avoir converti son monde.
+
+Vérifications d'intégrité
+-------------------------
+  - data version cible inchangée : 5023 (26.3) ;
+  - l'upgrade vanilla reste court-circuité ('Starting upgrade' : 0 occurrence) ;
+  - identité stricte v1.6.0 <-> v1.7.0 sur les 5 étapes du pipeline (61/61) ;
+  - E2E serveur dédié complet (PREUVE-TESTS-1.7.0.txt) : 7 vérifications en
+    jeu OK (or, coffre, spawner, Nether, chunks négatifs, sans lumière),
+    entités, level.dat, listes vides - le tout sur le layout par-dimension.

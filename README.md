@@ -9,6 +9,43 @@ Il restaure les conversions **pré-Anvil** que Mojang a retirées du jeu à part
 série 26.x, et remet ainsi les mondes de **Minecraft 1.0 (novembre 2011)** — et de toute la
 zone McRegion (Beta 1.3 → 1.1.2) — sur les rails de mise à jour officielles, jusqu'à la 26.3.
 
+**Nouveau dans la 1.7.0 — le reste du pipeline DFU réécrit de zéro + support du nouveau layout de stockage 26.x** :
+
+- **support du nouveau layout par-dimension** : les builds 26.x récents (même id
+  « 26.3 », même data version 5023) lisent les chunks dans
+  `dimensions/minecraft/<dimension>/region/` au lieu de `region/` à la racine du
+  monde. Un monde estampillé DataVersion saute le pass vanilla qui migrait les
+  dossiers — le mod détecte donc à l'exécution le layout que le jeu en cours
+  lit et écrit les chunks au bon endroit (y compris le Nether `DIM-1` →
+  `the_nether`, l'End `DIM1` → `the_end`, et `playerdata/` pour le fichier
+  joueur) ;
+- **migration automatique des mondes déjà convertis** : un monde converti dans
+  l'ancien layout par une version antérieure (mod + jeu) est migré au premier
+  lancement sur un build récent — exactement les déplacements de
+  `DimensionStorageFileFix` (`region/` → `dimensions/minecraft/overworld/region`,
+  `players/data` → `playerdata`), avec marqueur
+  `legacyworldfix/migrated-to-dimension-layout.txt`. Idempotent ;
+- **codec réécrit de zéro** (`RegionIo`) : moteurs Inflater/Deflater poolés par
+  thread, inflate/deflate one-shot plein buffer (l'ancienne branche zlib McRegion
+  traînait un `InflaterInputStream` à 512 octets), entête gzip RFC 1952 lu à la
+  main avec repli sûr. Identité stricte des octets écrits sur disque prouvée 61/61
+  chunks ;
+- **reshape réécrit de zéro** (`transformChunkNbt`) : passe unique fusionnée — les
+  sections tout-air n'allouent plus rien du tout (ni tableaux, ni tags, ni
+  nibbles), la détection d'air est faite pendant la copie. Sorties identiques
+  prouvées 61/61 ;
+- **composition des règles DFU cachée en arrière-plan** : le premier chunk payait
+  4,2-4,3 s de composition de règles (mesuré trois fois) avant de convertir quoi
+  que ce soit. Le warm-up construit désormais les règles CHUNK + LEVEL + PLAYER en
+  arrière-plan pendant l'écran titre / le scan de monde — visible dans le log :
+  `Datafixer ready in N ms (built 0 ms, rules composed N ms, prebuilt in background)`.
+  En jeu : le premier monde converti attend la composition (~4 s sur la machine de
+  bench), les suivants partent immédiatement (154 ms et 393 ms mesurés) ;
+- **coût propre du mod passé sous la milliseconde par chunk** : reshape 0,151 →
+  0,071 ms, décodage gzip ×1,8, compression ×1,19. Le moteur DFU reste >97 % du
+  temps (code Mojang, déjà parallélisé sur tous les coeurs). Chiffres et preuves :
+  `docs/BENCH-PERF-1.7.0.txt`, `docs/PREUVE-TESTS-1.7.0.txt`.
+
 **Nouveau dans la 1.6.0 — optimisation continue du DFU** :
 
 - **les listes `Entities`/`TileEntities` vides n'entrent plus dans la chaîne DFU**

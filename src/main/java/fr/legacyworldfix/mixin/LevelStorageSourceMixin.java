@@ -40,10 +40,11 @@ public abstract class LevelStorageSourceMixin {
         ) {
                 try {
                         Path worldDir = levelDirectory.path();
-                        if (LegacyMcRegionUpgrader.isLegacyWorld(worldDir)) {
-                                if (LegacyMcRegionUpgrader.convertWorld(worldDir) && dataTag.getValue() instanceof CompoundTag compoundTag) {
-                                        LegacyMcRegionUpgrader.patchInMemoryTag(compoundTag, worldDir);
-                                }
+                        // prepareWorld migrates the storage folders of worlds an older
+                        // mod/game pair already converted (idempotent, cheap) and
+                        // converts the world when it is still legacy.
+                        if (LegacyMcRegionUpgrader.prepareWorld(worldDir) && dataTag.getValue() instanceof CompoundTag compoundTag) {
+                                LegacyMcRegionUpgrader.patchInMemoryTag(compoundTag, worldDir);
                         }
                 } catch (Exception e) {
                         LegacyWorldFix.LOGGER.error(

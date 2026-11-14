@@ -17,19 +17,27 @@ public class LegacyWorldFix implements ModInitializer {
         public void onInitialize() {
                 LOGGER.info("[LegacyWorldFix] Loaded - worlds saved before 1.6.4 (Indev/Classic, Infdev/Alpha, McRegion, early Anvil) can be upgraded again");
 
-                // The vanilla datafixer is a lazy singleton: the first conversion that
-                // touches it would also pay its construction (~1 s of rule building)
-                // plus the lazy per-type rule composition. Kicking it off right now
-                // hides that cost behind the title screen on the client, and on the
-                // dedicated server it overlaps the world scan instead of serializing
-                // behind it. Class initialisation is thread-safe, so whichever thread
-                // gets there first pays once and everyone else just waits on the lock.
+                // The vanilla datafixer is a lazy singleton with lazy rule
+                // composition: the first conversion that touches it pays the
+                // construction (~0.7 s of rule building) AND several seconds of
+                // per-type rule composition for the 99 -> current version range
+                // (measured 4.3 s for CHUNK). Both now run in this background
+                // thread - on the client behind the title screen, on the dedicated
+                // server overlapping the world scan - so the first real chunk never
+                // sees them. Class initialisation is thread-safe, and the DFU
+                // caches the composed rules: whichever thread gets there first
+                // pays once and everyone else waits on the warm cache.
                 Thread prebuild = new Thread(() -> {
                         try {
                                 long start = System.nanoTime();
                                 DataFixers.getDataFixer();
-                                LOGGER.info("[LegacyWorldFix] Datafixer ready in {} ms (prebuilt in background)",
-                                        (System.nanoTime() - start) / 1_000_000L);
+                                long built = System.nanoTime();
+                                LegacyMcRegionUpgrader.warmupDataFixerPipelines();
+                                LOGGER.info(
+                                        "[LegacyWorldFix] Datafixer ready in {} ms (built {} ms, rules composed {} ms, prebuilt in background)",
+                                        (System.nanoTime() - start) / 1_000_000L,
+                                        (built - start) / 1_000_000L,
+                                        (System.nanoTime() - built) / 1_000_000L);
                         } catch (Throwable t) {
                                 LOGGER.warn("[LegacyWorldFix] Background datafixer prebuild failed; the conversion will build it on demand", t);
                         }

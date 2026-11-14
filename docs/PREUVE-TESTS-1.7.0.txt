@@ -1,0 +1,73 @@
+PREUVE-TESTS 1.7.0 - LegacyWorldFix v1.7.0+mc26.3 (serveur dédié 26.3, Java 25)
+Date: 14 novembre 2026
+
+== Contexte : nouveau layout de stockage 26.x ==
+Le jar 26.3 résolu le 14/11 au matin (même id « 26.3 », même data version
+5023) lit les chunks dans dimensions/minecraft/<dimension>/region/ et déplace
+les anciens dossiers via DimensionStorageFileFix pendant le pass d'upgrade
+vanilla (« Cannot move file from /region to
+dimensions/minecraft/overworld/region: Target already exists » - observé).
+Un monde estampillé DataVersion saute ce pass : la 1.6.0 laissait donc le jeu
+régénérer silencieusement les mondes convertis sur ces builds (A/B prouvé :
+même symptôme avec le jar 1.6.0).
+
+== Conversion directe dans le nouveau layout (jar 1.7.0) ==
+Monde Beta 1.2 reconstruit au format d'époque exact (chunks c.<x>.<z>.dat
+gzips avec enveloppe Level, DIM-1, level.dat sans version) :
+[12:35:1x] [LegacyWorldFix] Datafixer ready in N ms (built 0 ms, rules composed N ms, prebuilt in background)
+[LegacyWorldFix] Pre-region world detected (Infdev/Alpha chunk files): .../run/rootstyletest
+[LegacyWorldFix] Converted 2 pre-region chunk(s) to Anvil ... - the vanilla upgrade pass is skipped
+[LegacyWorldFix] McRegion world detected (level.dat version 19132): .../run/mcregiontest
+[LegacyWorldFix] Converted 1 region file(s) / 2 chunk(s) from McRegion to Anvil ...
+[LegacyWorldFix] Pre-region world detected (Infdev/Alpha chunk files): .../run/beta12test
+[LegacyWorldFix] Converted 7 pre-region chunk(s) to Anvil ...
+[LegacyWorldFix] Converted 3 legacy world(s) in .../run before server start
+
+Emplacements vérifiés sur disque après conversion :
+  beta12test/dimensions/minecraft/overworld/region/r.*.mca   (chunks convertis)
+  beta12test/dimensions/minecraft/the_nether/region/r.0.0.mca (Nether DIM-1)
+  mcregiontest/dimensions/minecraft/overworld/region/r.0.0.mca
+  playerdata/<uuid>.dat (nouvel emplacement du fichier joueur)
+(Aucun dossier region/ ni DIM-1/ résiduel : les .mcr et c.*.dat sources sont
+supprimés, les dossiers vides nettoyés.)
+
+== Vérifications EN JEU (forceload + console, serveur dédié 26.3) ==
+  CHECK_GOLD_OK           execute if block 10 5 10 minecraft:gold_block
+  CHECK_NOLIGHT_OK        chunk Infdev précoce sans lumière/heightmap -> recréés
+  CHECK_CHEST_BLOCK_OK    coffre + contenu : data get block 6 6 6 Items
+                          -> [{count: 1, Slot: 0b, id: "minecraft:tnt"}]
+  CHECK_NEG1_OK           chunk (-1,-1) : or à (-8,5,-8)
+  CHECK_NEG2_OK           chunk (-13,45) : or à (-200,5,712)
+  CHECK_NETHER_OK         glowstone à (8,5,8) dans le Nether (DIM-1 converti)
+  CHECK_SPAWNER_BLOCK_OK  spawner à (20,6,4)
+  Pig Health 10.0f + UUID moderne ; Zombified Piglin Health 10.0f
+  Occurrences de 'Starting upgrade' : 0 (le pass vanilla reste court-circuité)
+
+== Vérifications hors-ligne (lecture directe des .mca) ==
+check_blocks.py : or (10,5,10)/(5,5,25), coffre (6,6,6) + TNT, stone (1,1,1),
+spawner (20,6,4) avec SpawnData.entity.id=minecraft:pig, glowstone nether
+(8,5,8) -> ALL BLOCK CHECKS PASSED
+(Le lecteur gère les deux formats de palette : {Name: ...} des builds
+précédents, chaînes et composacts {'': id} du build du 14/11.)
+verify_worlds.py : level.dat (version 19133, DataVersion 5023, Version.Id
+5023/26.3, LevelName) + entités des 3 mondes et du Nether -> ALL CHECKS PASSED
+check_empty_lists.py : chunks convertis vides sans listes d'entités, chunks
+peuplés avec listes -> ALL EMPTY-LIST CHECKS PASSED
+(NB : seuls les chunks convertis non re-sauvegardés par vanilla portent
+TerrainPopulated et sont vérifiables ; les chunks de spawn re-sauvegardés
+envoient leurs entités dans entities/*.mca - comportement vanilla normal.)
+
+== Migration des mondes déjà convertis (mise à jour du jeu) ==
+Simulation : monde converti par la paire mod/jeu précédente (chunks dans
+<monde>/region à la racine, level.dat estampillé), puis démarrage avec le jar
+1.7.0 sur le build récent :
+[LegacyWorldFix] World .../mcregiontest uses the current per-dimension storage layout - converted folders moved accordingly
+  region/ -> dimensions/minecraft/overworld/region (déplacé, marqueur
+  migrated-to-dimension-layout.txt écrit)
+En jeu après migration : GOLD_OK + CHEST_OK, 'Starting upgrade' : 0.
+Idempotence : un second démarrage ne déplace rien (cible déjà en place).
+
+== Identité stricte du recodage (BenchDfu mode oldnew, 61 chunks) ==
+transforms 61/61, sorties DFU 61/61, octets compressés 61/61,
+decodages zlib 61/61, decodages gzip 61/61
+(chiffres : docs/BENCH-PERF-1.7.0.txt)

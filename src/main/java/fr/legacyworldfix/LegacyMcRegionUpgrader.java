@@ -65,6 +65,12 @@ public final class LegacyMcRegionUpgrader {
         public static final int ANVIL_STORAGE_VERSION = 19133;
 
         /**
+         * The data version this game build upgrades everything to (5023 on 26.3).
+         * Hoisted once instead of re-walking the version objects for every chunk.
+         */
+        private static final int CURRENT_DATA_VERSION = SharedConstants.getCurrentVersion().dataVersion().version();
+
+        /**
          * One worker per logical core: the conversion blocks the calling thread
          * anyway, so there is no reason to keep a core idle, and the datafixer
          * pass is pure CPU that scales with cores. Bounded for safety.
@@ -178,6 +184,36 @@ public final class LegacyMcRegionUpgrader {
         }
 
         /**
+         * Prepares one world for the running game build. Two jobs, both
+         * idempotent: worlds an older mod/game pair converted into the previous
+         * storage layout get their folders moved into the layout this build
+         * reads (the move vanilla's own DimensionStorageFileFix would perform,
+         * which the DataVersion stamps otherwise skip), and worlds still in a
+         * legacy format are converted. Returns true when a legacy conversion
+         * happened just now - the caller's in-memory level tag then needs
+         * patching (see {@link #patchInMemoryTag}).
+         */
+        public static boolean prepareWorld(Path worldDir) {
+                Object lock = WORLD_LOCKS.computeIfAbsent(worldDir.toAbsolutePath().normalize(), key -> new Object());
+                synchronized (lock) {
+                        try {
+                                StorageLayout.migrateToPerDimensionLayoutIfNeeded(worldDir);
+                        } catch (IOException e) {
+                                LegacyWorldFix.LOGGER.warn(
+                                        "[LegacyWorldFix] Could not migrate the storage layout of {}: {} - the world keeps the previous folder layout",
+                                        worldDir,
+                                        e.toString());
+                        }
+
+                        LegacyFormat format = detectFormat(worldDir);
+                        if (format == LegacyFormat.NONE || format == LegacyFormat.ANVIL) {
+                                return false;
+                        }
+                        return convertWorld(worldDir);
+                }
+        }
+
+        /**
          * Converts the world in place if (and only if) it still uses a legacy
          * storage format. Failures leave level.dat untouched, so the world remains
          * an honest legacy world and vanilla keeps refusing it (no half states).
@@ -243,9 +279,8 @@ public final class LegacyMcRegionUpgrader {
          * slower, but identical output.
          */
         static CompoundTag applyVanillaDataFixes(CompoundTag chunkRoot, String dimensionId, String generatorId) {
-                int currentVersion = SharedConstants.getCurrentVersion().dataVersion().version();
                 int version = NbtUtils.getDataVersion(chunkRoot, -1);
-                if (version >= currentVersion) {
+                if (version >= CURRENT_DATA_VERSION) {
                         return chunkRoot;
                 }
 
@@ -254,9 +289,9 @@ public final class LegacyMcRegionUpgrader {
                 context.putString("generator", generatorId);
                 chunkRoot.put("__context", context);
                 try {
-                        CompoundTag upgraded = DataFixTypes.CHUNK.update(DataFixers.getDataFixer(), chunkRoot, version, currentVersion);
+                        CompoundTag upgraded = DataFixTypes.CHUNK.update(DataFixers.getDataFixer(), chunkRoot, version, CURRENT_DATA_VERSION);
                         upgraded.remove("__context");
-                        NbtUtils.addDataVersion(upgraded, currentVersion);
+                        NbtUtils.addDataVersion(upgraded, CURRENT_DATA_VERSION);
                         return upgraded;
                 } catch (RuntimeException e) {
                         LegacyWorldFix.LOGGER.warn(
@@ -296,11 +331,16 @@ public final class LegacyMcRegionUpgrader {
                 try {
                         List<Path[]> pairs = new ArrayList<>();
                         for (Path regionDir : findRegionDirectories(worldDir)) {
+                                Path dimensionRoot = regionDir.getParent();
+                                // Chunks are written where the RUNNING game reads them:
+                                // <world>/region on early 26.x builds, per-dimension
+                                // folders on newer ones - which may differ from where the
+                                // legacy .mcr containers sit.
+                                Path outputDir = StorageLayout.regionDir(dimensionRoot);
                                 try (DirectoryStream<Path> stream = Files.newDirectoryStream(regionDir, "r.*.*.mcr")) {
                                         for (Path mcr : stream) {
                                                 String fileName = mcr.getFileName().toString();
-                                                Path mca = mcr.resolveSibling(fileName.substring(0, fileName.length() - 4) + ".mca");
-                                                pairs.add(new Path[]{mcr, mca, regionDir.getParent()});
+                                                pairs.add(new Path[]{mcr, outputDir.resolve(fileName.substring(0, fileName.length() - 4) + ".mca"), dimensionRoot});
                                         }
                                 }
                         }
@@ -456,7 +496,7 @@ public final class LegacyMcRegionUpgrader {
                 int converted = 0;
                 try (Stream<Path> entries = Files.list(directory)) {
                         for (Path candidate : entries.filter(Files::isDirectory).toList()) {
-                                if (isLegacyWorld(candidate) && convertWorld(candidate)) {
+                                if (prepareWorld(candidate)) {
                                         converted++;
                                 }
                         }
@@ -592,52 +632,32 @@ public final class LegacyMcRegionUpgrader {
                         level.put("HeightMap", heightMap.copy());
                 }
 
-                // 16x16x128 flat storage -> 8 sections of 16x16x16. Light arrays are
-                // intentionally omitted (see the class-level note: the vanilla chain
-                // deletes them anyway and the light engine rebuilds them on load).
-                ListTag allSections = new ListTag();
-                for (int sectionY = 0; sectionY < 8; sectionY++) {
-                        byte[] sectionBlocks = new byte[4096];
-                        byte[] sectionData = new byte[2048];
-
-                        for (int yLocal = 0; yLocal < 16; yLocal++) {
-                                int y = sectionY * 16 + yLocal;
-                                for (int z = 0; z < 16; z++) {
-                                        for (int x = 0; x < 16; x++) {
-                                                int oldIndex = (x << 11) | (z << 7) | y;
-                                                int newIndex = (yLocal << 8) | (z << 4) | x;
-
-                                                sectionBlocks[newIndex] = blocks[oldIndex];
-                                                setNibble(sectionData, newIndex, getNibble(data, oldIndex));
-                                        }
-                                }
-                        }
-
-                        CompoundTag section = new CompoundTag();
-                        section.putByte("Y", (byte) sectionY);
-                        section.putByteArray("Blocks", sectionBlocks);
-                        section.putByteArray("Data", sectionData);
-                        allSections.add(allSections.size(), section);
-                }
-
-                // All-air sections never enter the datafixer chain. Modern vanilla
-                // itself omits those sections when it saves chunks (a section that
-                // is nothing but air is not written to the region file), so a tag
-                // without them is the ordinary current-version shape, and loading a
-                // chunk whose sky sections are absent is the everyday path. Skipping
-                // them at the source removes up to half of the data the ~500
-                // datafixers walk through (measured: 80 -> 37 ms/chunk single-thread
-                // on a full Alpha chunk, with the surviving sections byte-identical).
-                // A chunk without any terrain keeps all eight sections: an empty
-                // Sections list is a shape this conversion has no proof for, and
-                // all-air chunks are a rare border case not worth it.
+                // 16x16x128 flat storage -> 8 sections of 16x16x16, rewritten in
+                // v1.7.0 as a single fused pass: the source column for every (x, z)
+                // is 16 contiguous bytes, the copy walks them once and records
+                // whether the section holds any block at all. All-air sections
+                // never materialize - no arrays, no tag, no second scan - and only
+                // non-air sections pay the Data-nibble reshape.
                 ListTag sections = new ListTag();
-                for (int i = 0; i < allSections.size(); i++) {
-                        if (allSections.get(i) instanceof CompoundTag section && !isAllAir(section)) {
+                for (int sectionY = 0; sectionY < 8; sectionY++) {
+                        CompoundTag section = buildSectionIfNonAir(sectionY, blocks, data);
+                        if (section != null) {
                                 sections.add(sections.size(), section);
                         }
                 }
-                level.put("Sections", sections.isEmpty() ? allSections : sections);
+                if (sections.isEmpty()) {
+                        // A chunk without any terrain keeps all eight sections: an empty
+                        // Sections list is a shape this conversion has no proof for, and
+                        // all-air chunks are a rare border case not worth it.
+                        for (int sectionY = 0; sectionY < 8; sectionY++) {
+                                CompoundTag section = new CompoundTag();
+                                section.putByte("Y", (byte) sectionY);
+                                section.putByteArray("Blocks", new byte[4096]);
+                                section.putByteArray("Data", new byte[2048]);
+                                sections.add(sections.size(), section);
+                        }
+                }
+                level.put("Sections", sections);
 
                 // Entities: normalize pre-1.6 health (short) to the float type introduced in 1.6.
                 ListTag entities = oldLevel.getListOrEmpty("Entities");
@@ -667,15 +687,54 @@ public final class LegacyMcRegionUpgrader {
                 return newRoot;
         }
 
-        /** True when a freshly split section carries no block at all (all 4096 bytes zero). */
-        private static boolean isAllAir(CompoundTag section) {
-                byte[] blocks = section.getByteArray("Blocks").orElse(new byte[0]);
-                for (byte block : blocks) {
-                        if (block != 0) {
-                                return false;
+        /**
+         * Builds one Anvil section (Y 0-7) from the flat McRegion arrays, or
+         * returns null when the section is nothing but air. The all-air test is
+         * fused into the block copy (one pass over the source columns instead of
+         * copy-then-rescan) and an air section allocates nothing at all - not the
+         * 4096+2048 bytes, not the tag, and none of the Data-nibble work, since
+         * those sections never reach the datafixer chain anyway (see the class
+         * comment on {@link #transformChunkNbt}).
+         */
+        private static CompoundTag buildSectionIfNonAir(int sectionY, byte[] blocks, byte[] data) {
+                byte[] sectionBlocks = new byte[4096];
+                boolean anyBlock = false;
+                int baseY = sectionY << 4;
+
+                for (int z = 0; z < 16; z++) {
+                        for (int x = 0; x < 16; x++) {
+                                int source = (x << 11) | (z << 7) | baseY;
+                                int target = (z << 4) | x;
+                                for (int y = 0; y < 16; y++) {
+                                        byte block = blocks[source + y];
+                                        sectionBlocks[target] = block;
+                                        if (block != 0) {
+                                                anyBlock = true;
+                                        }
+                                        target += 256;
+                                }
                         }
                 }
-                return true;
+
+                if (!anyBlock) {
+                        return null;
+                }
+
+                byte[] sectionData = new byte[2048];
+                for (int z = 0; z < 16; z++) {
+                        for (int x = 0; x < 16; x++) {
+                                int source = (x << 11) | (z << 7) | baseY;
+                                for (int y = 0; y < 16; y++) {
+                                        setNibble(sectionData, (y << 8) | (z << 4) | x, getNibble(data, source + y));
+                                }
+                        }
+                }
+
+                CompoundTag section = new CompoundTag();
+                section.putByte("Y", (byte) sectionY);
+                section.putByteArray("Blocks", sectionBlocks);
+                section.putByteArray("Data", sectionData);
+                return section;
         }
 
         private static void fixEntityHealth(CompoundTag entity) {
@@ -707,6 +766,65 @@ public final class LegacyMcRegionUpgrader {
         }
 
         /**
+         * Composes the datafixer rules for every type this mod upgrades, before
+         * any real world conversion needs them. The DFU composes its rules lazily
+         * per (type, version range): the very first chunk fed through the chain
+         * pays several seconds of rule building (measured 4.3 s for CHUNK on the
+         * bench box) before a single byte of data moves. Running one synthetic
+         * upgrade per type here - from the same oldest version the converters
+         * feed - moves that cost into the background prebuild thread, where it
+         * overlaps the title screen / world scan instead of delaying the first
+         * chunks. The composed rules are cached inside the shared DFU, so every
+         * real chunk afterwards hits them warm; the DFU is thread-safe, and a
+         * conversion starting concurrently simply waits for the same cached rule.
+         *
+         * <p>Best effort by design: any failure is logged and ignored - the
+         * conversion path then pays the composition itself, exactly like before.
+         */
+        static void warmupDataFixerPipelines() {
+                try {
+                        // CHUNK: the exact shape every converter feeds the chain - an
+                        // all-air Alpha chunk goes through the real transform, so the
+                        // warmup also JIT-compiles the pipeline the workers will run.
+                        CompoundTag transformed = transformChunkNbt(allAirAlphaChunk());
+                        applyVanillaDataFixes(transformed, "minecraft:overworld", "minecraft:noise");
+                } catch (Throwable t) {
+                        LegacyWorldFix.LOGGER.warn("[LegacyWorldFix] Chunk rule warmup incomplete: {}", t.toString());
+                }
+                try {
+                        // LEVEL: level.dat upgrade (patchLevelDat), oldest-version input.
+                        CompoundTag data = new CompoundTag();
+                        data.putInt("version", MCREGION_STORAGE_VERSION);
+                        data.putString("LevelType", "default");
+                        data.putLong("RandomSeed", 0L);
+                        DataFixTypes.LEVEL.update(DataFixers.getDataFixer(), data, NbtUtils.getDataVersion(data, -1), CURRENT_DATA_VERSION);
+                } catch (Throwable t) {
+                        LegacyWorldFix.LOGGER.warn("[LegacyWorldFix] Level rule warmup incomplete: {}", t.toString());
+                }
+                try {
+                        // PLAYER: the level.dat player (movePlayerToPlayerData).
+                        DataFixTypes.PLAYER.update(DataFixers.getDataFixer(), new CompoundTag(), NbtUtils.getDataVersion(new CompoundTag(), -1), CURRENT_DATA_VERSION);
+                } catch (Throwable t) {
+                        LegacyWorldFix.LOGGER.warn("[LegacyWorldFix] Player rule warmup incomplete: {}", t.toString());
+                }
+        }
+
+        /** A minimal pre-Anvil all-air chunk, the shape the converters feed the chain. */
+        private static CompoundTag allAirAlphaChunk() {
+                CompoundTag level = new CompoundTag();
+                level.putInt("xPos", 0);
+                level.putInt("zPos", 0);
+                level.putLong("LastUpdate", 0L);
+                level.putBoolean("TerrainPopulated", true);
+                level.putByteArray("Blocks", new byte[32768]);
+                level.putByteArray("Data", new byte[16384]);
+                level.putByteArray("HeightMap", new byte[256]);
+                CompoundTag root = new CompoundTag();
+                root.put("Level", level);
+                return root;
+        }
+
+        /**
          * Rewrites level.dat the way the vanilla 26.x "file fixing" pass would:
          * the storage version goes to Anvil, the whole LEVEL datafixer chain runs
          * in place, the current DataVersion is stamped, and the state the current
@@ -731,7 +849,7 @@ public final class LegacyMcRegionUpgrader {
                 long legacySeed = data.getLongOr("RandomSeed", 0L);
                 boolean legacyMapFeatures = data.getBooleanOr("MapFeatures", true);
 
-                int currentVersion = SharedConstants.getCurrentVersion().dataVersion().version();
+                int currentVersion = CURRENT_DATA_VERSION;
                 int dataVersion = data.getIntOr("DataVersion", -1);
                 boolean levelFixed = true;
                 if (dataVersion < currentVersion) {
@@ -897,7 +1015,7 @@ public final class LegacyMcRegionUpgrader {
                         uuid = net.minecraft.core.UUIDUtil.uuidFromIntArray(rawUuid);
                 }
 
-                Path playerFile = worldDir.resolve("players").resolve("data").resolve(uuid + ".dat");
+                Path playerFile = StorageLayout.playerDataDir(worldDir).resolve(uuid + ".dat");
                 Files.createDirectories(playerFile.getParent());
                 NbtUtils.addDataVersion(upgraded, currentVersion);
                 NbtIo.writeCompressed(upgraded, playerFile);
@@ -946,7 +1064,8 @@ public final class LegacyMcRegionUpgrader {
                 Files.createDirectories(markerDir);
                 StringBuilder content = new StringBuilder()
                         .append(title).append('\n')
-                        .append("Date: ").append(Instant.now()).append('\n');
+                        .append("Date: ").append(Instant.now()).append('\n')
+                        .append("Storage layout: ").append(StorageLayout.describe()).append('\n');
                 if (regions > 0) {
                         content.append("Region files: ").append(regions).append('\n');
                 }

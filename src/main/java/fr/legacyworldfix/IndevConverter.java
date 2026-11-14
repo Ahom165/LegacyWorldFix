@@ -81,7 +81,7 @@ final class IndevConverter {
 
                         // Slice the map into chunks, one writer per target region file.
                         Map<Path, RegionIo.AnvilRegionWriter> writers = new HashMap<>();
-                        Path regionDir = worldDir.resolve("region");
+                        Path regionDir = StorageLayout.regionDir(worldDir);
                         Files.createDirectories(regionDir);
                         int timestamp = (int) (System.currentTimeMillis() / 1000L);
 

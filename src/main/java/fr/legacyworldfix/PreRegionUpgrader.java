@@ -160,7 +160,7 @@ final class PreRegionUpgrader {
                                 return 0L;
                         }
 
-                        Path regionFile = chunk.dimensionRoot().resolve("region")
+                        Path regionFile = StorageLayout.regionDir(chunk.dimensionRoot())
                                 .resolve("r." + (chunk.x() >> 5) + "." + (chunk.z() >> 5) + ".mca");
                         RegionTarget target = targets.computeIfAbsent(regionFile, RegionTarget::new);
                         byte[] compressed = RegionIo.zlibNbt(transformed);
