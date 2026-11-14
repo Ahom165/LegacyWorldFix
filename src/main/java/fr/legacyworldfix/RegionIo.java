@@ -45,6 +45,7 @@ final class RegionIo {
 
         private static final int SECTOR_BYTES = 4096;
         static final int HEADER_BYTES = 8192;
+        private static final int GZIP_BUFFER = 1 << 16;
         private static final int COMPRESSION_GZIP = 1;
         private static final int COMPRESSION_ZLIB = 2;
         private static final int COMPRESSION_NONE = 3;
@@ -147,7 +148,7 @@ final class RegionIo {
         /** Inflates and parses one raw chunk payload. */
         static CompoundTag decodeChunk(RawChunk raw) throws IOException {
                 InputStream stream = switch (raw.compressionType()) {
-                        case COMPRESSION_GZIP -> new GZIPInputStream(new ByteArrayInputStream(raw.data()));
+                        case COMPRESSION_GZIP -> new GZIPInputStream(new ByteArrayInputStream(raw.data()), GZIP_BUFFER);
                         case COMPRESSION_ZLIB -> new InflaterInputStream(new ByteArrayInputStream(raw.data()));
                         case COMPRESSION_NONE -> new ByteArrayInputStream(raw.data());
                         default -> throw new IOException("Unknown chunk compression " + raw.compressionType());
@@ -165,7 +166,9 @@ final class RegionIo {
 
         /** Reads a loose, gzipped NBT file (pre-region chunk files and old level.dat variants). */
         static CompoundTag readGzippedNbt(Path file) throws IOException {
-                try (InputStream in = new GZIPInputStream(new BufferedInputStream(Files.newInputStream(file)))) {
+                // 64 KiB inflater buffer: the GZIP default of 512 bytes turns every
+                // ~10-50 KiB chunk file into ~20-100 refill round-trips.
+                try (InputStream in = new GZIPInputStream(new BufferedInputStream(Files.newInputStream(file)), GZIP_BUFFER)) {
                         return NbtIo.read(new DataInputStream(in), NbtAccounter.unlimitedHeap());
                 }
         }

@@ -9,6 +9,29 @@ Il restaure les conversions **pré-Anvil** que Mojang a retirées du jeu à part
 série 26.x, et remet ainsi les mondes de **Minecraft 1.0 (novembre 2011)** — et de toute la
 zone McRegion (Beta 1.3 → 1.1.2) — sur les rails de mise à jour officielles, jusqu'à la 26.3.
 
+**Nouveau dans la 1.6.0 — optimisation continue du DFU** :
+
+- **les listes `Entities`/`TileEntities` vides n'entrent plus dans la chaîne DFU**
+  (clé absente). Équivalence prouvée 12/12 chunks par candidat — sections
+  strictement égales, champs égaux modulo absent-vs-liste-vide, la même classe
+  d'équivalence que `UpgradeData Indices` en 1.4.0 ; vanilla lit une clé absente
+  comme une liste vide et réécrit les listes à la première sauvegarde du chunk.
+  Vérifié sur disque après E2E : chunks vides sans clé, chunks peuplés intacts
+  (`docs/PREUVE-TESTS-1.6.0.txt`). Honnêteté : le gain mesuré est ~nul
+  (mesure d'isolation : absentes 2,7 ms/chunk vs vides 2,7 ms/chunk) — c'est un
+  changement de propreté/équivalence, pas de vitesse ;
+- **candidats rejetés avec preuve** : `LastUpdate` (la chaîne le conserve en
+  sortie), `HeightMap`, `TerrainPopulated` (il pilote `below_zero_retrogen`) ;
+- **le coût réel des chunks peuplés est identifié et irréductible** : 2 mobs +
+  3 tile entities ≈ +28-35 ms/chunk (machinerie DFU par élément, code Mojang,
+  identique à l'upgrade vanilla) contre ~3-8 ms pour un chunk sans entités ;
+- **log de progression live** : `Converting pre-region chunks: 600/1195
+  (~N chunks/s)` toutes les ~10 % — la parallélisation devient visible et toute
+  lenteur résiduelle est mesurable chez vous ;
+- **pool de threads partagé** (plus de création par monde/phase) et **buffers
+  gzip 64 Kio** (le défaut Java est 512 o) ;
+- GC testé (G1 vs ParallelGC) : effet nul — inutile de changer vos flags.
+
 **Nouveau dans la 1.5.0 — recodage du hot path DFU** (réponse à « recode les morceaux
 du DFU mal opti ») :
 

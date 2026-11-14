@@ -1,0 +1,71 @@
+PREUVE-TESTS 1.6.0 - LegacyWorldFix v1.6.0+mc26.3 (serveur dedie 26.3, Java 25)
+Date: 2026-11-14
+
+== Monde Beta 1.2 reconstruit au format d'epoque exact (chunks c.<x>.<z>.dat gzips, enveloppe Level, DIM-1) ==
+[11:33:37] ain/INFO] (legacyworldfix) [LegacyWorldFix] Loaded - worlds saved before 1.6.4 (Indev/Classic, Infdev/Alpha, McRegion, early Anvil) can be upgraded again
+[11:33:37] [LegacyWorldFix-DFU-Prebuild/INFO] (legacyworldfix) [LegacyWorldFix] Datafixer ready in 0 ms (prebuilt in background)
+[11:33:37] ain/INFO] (legacyworldfix) [LegacyWorldFix] Pre-region world detected (Infdev/Alpha chunk files): .../run/rootstyletest
+[11:33:41] ain/INFO] (legacyworldfix) [LegacyWorldFix] Converting pre-region chunks: 1/2 (~0 chunks/s)      <- NOUVEAU: log de progression
+[11:33:41] [LegacyWorldFix-Converter/INFO] (legacyworldfix) [LegacyWorldFix] Converting pre-region chunks: 2/2 (~0 chunks/s)
+[11:33:42] ain/INFO] (legacyworldfix) [LegacyWorldFix] Converted 2 pre-region chunk(s) to Anvil in 4662 ms (~2331 ms/chunk on 2 threads, data fixes applied in place) - the vanilla upgrade pass is skipped
+[11:33:42] ain/INFO] (legacyworldfix) [LegacyWorldFix] McRegion world detected (level.dat version 19132): .../run/mcregiontest
+[11:33:42] ain/INFO] (legacyworldfix) [LegacyWorldFix] Converting McRegion chunks: 1/2 (~8 chunks/s)       <- NOUVEAU
+[11:33:42] [LegacyWorldFix-Converter/INFO] (legacyworldfix) [LegacyWorldFix] Converting McRegion chunks: 2/2 (~13 chunks/s)
+[11:33:42] ain/INFO] (legacyworldfix) [LegacyWorldFix] Converted 1 region file(s) / 2 chunk(s) from McRegion to Anvil in 197 ms (~98 ms/chunk on 2 threads, data fixes applied in place) - the vanilla upgrade pass is skipped
+[11:33:42] ain/INFO] (legacyworldfix) [LegacyWorldFix] Pre-region world detected (Infdev/Alpha chunk files): .../run/beta12test
+[11:33:42] ain/INFO] (legacyworldfix) [LegacyWorldFix] Converting pre-region chunks: 1/7 ... 7/7 (~20-45 chunks/s)  <- NOUVEAU
+[11:33:42] ain/INFO] (legacyworldfix) [LegacyWorldFix] Converted 7 pre-region chunk(s) to Anvil in 368 ms (~52 ms/chunk on 2 threads, data fixes applied in place) - the vanilla upgrade pass is skipped
+[11:33:42] ain/INFO] (legacyworldfix) [LegacyWorldFix] Converted 3 legacy world(s) in .../run before server start
+
+(Les temps du mini-monde E2E incluent le warm-up DFU du premier chunk ; sur
+le monde reel de 1195 chunks le cout par chunk est celui du BENCH-PERF-1.6.0.)
+
+== Aucun passage d'upgrade vanilla ==
+Occurrences de 'Starting upgrade' dans tout le log du serveur : 0
+
+== Verification hors-ligne des 3 mondes convertis (verify_worlds.py) ==
+OK   beta12test/overworld entities: minecraft:pig minecraft:chicken Health=4.0 UUID=True | minecraft:pig Health=10.0 UUID=True | ... | minecraft:sheep Health=8.0
+OK   beta12test/DIM-1 entities: minecraft:zombified_piglin minecraft:zombified_piglin Health=10.0 UUID=False
+OK   rootstyletest/overworld entities: minecraft:pig minecraft:pig Health=10.0 UUID=False
+OK   mcregiontest/overworld entities: minecraft:pig ... Health=10.0 UUID=True | minecraft:sheep Health=8.0 UUID=True
+OK   beta12test level.dat version version=19133
+OK   beta12test level.dat DataVersion DataVersion=5023
+OK   beta12test level.dat Version.Id Version={'Id': 5023, 'Name': '26.3'}
+(rootstyletest et mcregiontest : idem, RESULT: ALL CHECKS PASSED)
+
+== Blocs et tile entities des chunks convertis (check_blocks.py, lecture directe des .mca) ==
+OK   gold_block @ (10,5,10): minecraft:gold_block
+OK   gold_block @ (5,5,25): minecraft:gold_block
+OK   chest block entity @ (6,6,6): minecraft:chest
+OK   chest Items: minecraft:tnt
+OK   stone @ (1,1,1): minecraft:stone
+OK   spawner block entity @ (20,6,4): minecraft:mob_spawner
+OK   spawner SpawnData.entity.id: minecraft:pig
+OK   glowstone @ nether (8,5,8): minecraft:glowstone
+RESULT: ALL BLOCK CHECKS PASSED
+
+== NOUVEAU 1.6.0 - listes Entities/TileEntities vides (check_empty_lists.py, lecture directe des .mca) ==
+OK   beta12test/region slot 1023 empty chunk carries NO entity lists    <- (chunk (-1,-1))
+OK   beta12test/region slot 403 empty chunk carries NO entity lists     <- (chunk (-13,44))
+OK   beta12test/region slot 0 populated chunk keeps its lists (1 ent, 1 TE)   <- pig + chest
+OK   beta12test/region slot 1 populated chunk keeps its lists (0 ent, 1 TE)   <- spawner
+OK   beta12test/region slot 32 empty chunk carries NO entity lists      <- (chunk (0,1), sans lumiere)
+OK   beta12test/DIM-1/region slot 0 populated chunk keeps its lists (1 ent, 0 TE) <- zombified piglin
+OK   beta12test/DIM-1/region slot 1 empty chunk carries NO entity lists
+OK   mcregiontest/region slot 0 populated chunk keeps its lists (1 ent, 1 TE)
+OK   mcregiontest/region slot 1 empty chunk carries NO entity lists
+OK   rootstyletest/region slot 0 populated chunk keeps its lists (1 ent, 1 TE)
+OK   rootstyletest/region slot 1 empty chunk carries NO entity lists
+RESULT: ALL EMPTY-LIST CHECKS PASSED (6 empty, 5 populated)
+
+Le serveur vanilla a charge et servi les trois mondes convertis avec la forme
+"absente" sur disque : lecture sans erreur, commandes /execute if block,
+/data get entity et /data get block toutes OK.
+
+== Equivalence des trims (BenchDfu mode "trim", 12/12 chunks par candidat) ==
+  Entities (vide -> absente)      : PASS (sections strictement egales, champs
+                                    egaux modulo absent-vs-liste-vide)
+  TileEntities (vide -> absente)  : PASS
+  LastUpdate / HeightMap / TerrainPopulated : FAIL -> rejetes (la chaine
+                                    conserve ou consomme ces champs)
+Détails chiffrés : docs/BENCH-PERF-1.6.0.txt

@@ -1,0 +1,74 @@
+BENCHMARK PERFORMANCES - v1.6.0 (14 novembre 2026)
+====================================================
+
+Question : « continue l'opti de dfu »
+
+Ce qui a été tenté, mesuré, gardé ou rejeté
+--------------------------------------------
+Banc : BenchDfu hors-jeu (classpath deobf 26.3 + DFU 10.0.21), protocole équitable
+(réchauffage des DEUX formes, passes alternées, min sur 2 passes), CPU 2 coeurs.
+
+1. STRIP DES LISTES VIDES Entities / TileEntities  - GARDÉ (preuve, pas vitesse)
+   Nouveau dans transformChunkNbt : une liste Entities/TileEntities vide n'entre
+   plus dans la chaîne DFU (clé absente).
+   ÉQUIVALENCE PROUVÉE (mode "trim") : 12/12 chunks par candidat, sections
+   strictement égales, champs de chunk égaux modulo absent-vs-liste-vide (même
+   classe d'équivalence que UpgradeData Indices en 1.4.0). Vanilla lit une clé
+   absente comme une liste vide (getListOrEmpty) et réécrit les listes à la
+   première sauvegarde du chunk.
+   Vérifié positivement sur disque après E2E (check_empty_lists.py) :
+   6 chunks vides SANS clé "entities"/"block_entities", 5 chunks peuplés qui
+   gardent leurs listes.
+   VÉRITÉ SUR LA VITESSE : ~0 ms/chunk. Mesure d'isolation (terrain identique,
+   12 chunks, JIT chaud) : listes ABSENTES = 2,7 ms/chunk, listes VIDES =
+   2,7 ms/chunk. Le -58 ms/chunk d'une première mesure froide était un artefact
+   de ramp-up JIT (même leçon qu'en 1.5.0). Intérêt réel : arbres NBT plus
+   petits dans toute la chaîne, sortie plus propre, aucun coût.
+
+2. CANDIDATS REJETÉS (preuve en main)
+   - LastUpdate : REJETÉ - la chaîne CONSERVE le champ en sortie (absent =
+     sortie différente de vanilla).
+   - HeightMap : REJETÉ (sortie modifiée).
+   - TerrainPopulated : REJETÉ - il alimente below_zero_retrogen/target_status
+     ("minecraft:spawn" vs "minecraft:terrain" mesuré en sa faveur).
+
+3. ISOLATION DU COÛT ENTITÉS (le résultat le plus utile du run)
+   Terrain identique, 12 chunks, seules les listes changent :
+     listes absentes/vides  :  ~2,7 - 8 ms/chunk
+     2 mobs + 3 tile entities : ~28 - 35 ms/chunk
+   Le coût par ÉLÉMENT de la machinerie DFU (~160 fixers d'entités + ~60 de
+   block entities, résolution de type par fixer et par élément) est LE poste
+   dominant des chunks peuplés. C'est du code Mojang, identique à l'upgrade
+   vanilla : irréductible sans réimplémenter la chaîne.
+
+4. GC : NULL
+   G1 (défaut) vs ParallelGC : 37,6 vs 37,6 ms/chunk slim - aucun effet.
+
+5. PIPELINE (toujours vrai, déjà en place)
+   - Tous les coeurs logiques, règle DFU composée une fois (warm-up), DFU
+     pré-construit au démarrage, écritures parallèles.
+
+NOUVEAUTÉS VISIBLES UTILISATEUR EN 1.6.0
+----------------------------------------
+  - Log de progression live : « Converting pre-region chunks: 600/1195
+    (~N chunks/s) » toutes les ~10% - la parallélisation est enfin visible
+    et toute lenteur résiduelle devient mesurable chez vous.
+  - Pool de threads partagé statique (plus de création de pool par monde/phase).
+  - Buffers gzip 64 KiB (défaut Java : 512 o - des dizaines de remplissages
+    par chunk évités).
+
+Où est la limite restante
+--------------------------
+Le profil ne change pas : le temps est dans le MOTEUR DataFixerUpper
+(PointFree.evalCached, comparaisons structurelles de types) et, pour les
+chunks peuplés, dans les fixers d'entités/tile entities par élément. Le seul
+levier reste le parallélisme (fait : tous les coeurs logiques) et, désormais,
+la visibilité : le log de progression dit exactement ce que fait la machine.
+
+Vérifications d'intégrité
+-------------------------
+  - data version cible inchangée : 5023 (26.3) ;
+  - l'upgrade vanilla reste court-circuité ('Starting upgrade' : 0 occurrence) ;
+  - E2E serveur dédié complet (PREUVE-TESTS-1.6.0.txt) : entités, blocs,
+    coffre, spawner modernisé, Nether - tout identique à la 1.5.0, plus la
+    vérification positive des listes vides/peuplées sur disque.

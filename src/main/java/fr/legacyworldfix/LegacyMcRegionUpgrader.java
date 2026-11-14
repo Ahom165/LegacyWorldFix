@@ -16,6 +16,7 @@ import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Stream;
 import net.minecraft.SharedConstants;
 import net.minecraft.nbt.ByteArrayTag;
@@ -316,6 +317,14 @@ public final class LegacyMcRegionUpgrader {
                         // granularity is what keeps every core busy even when the world
                         // spreads over only a handful of region files.
                         List<Callable<RegionIo.CompressedChunk>> tasks = new ArrayList<>();
+                        int rawTotal = 0;
+                        for (Path[] pair : pairs) {
+                                rawTotal += rawChunksBySource.getOrDefault(pair[0], List.of()).size();
+                        }
+                        final int total = rawTotal;
+                        java.util.concurrent.atomic.AtomicInteger done = new java.util.concurrent.atomic.AtomicInteger();
+                        int step = Math.max(1, total / 10);
+                        long phaseStart = System.nanoTime();
                         for (Path[] pair : pairs) {
                                 List<RegionIo.RawChunk> group = rawChunksBySource.get(pair[0]);
                                 if (group == null) {
@@ -327,7 +336,14 @@ public final class LegacyMcRegionUpgrader {
                                         tasks.add(() -> {
                                                 try {
                                                         CompoundTag chunk = RegionIo.decodeChunk(raw);
-                                                        return RegionIo.compressChunk(pair[0], raw, transformAndUpgradeChunk(chunk, dimensionId, generatorId));
+                                                        CompoundTag upgraded = transformAndUpgradeChunk(chunk, dimensionId, generatorId);
+                                                        int finished = done.incrementAndGet();
+                                                        if (finished % step == 0 || finished == total) {
+                                                                long ms = Math.max(1L, (System.nanoTime() - phaseStart) / 1_000_000L);
+                                                                LegacyWorldFix.LOGGER.info("[LegacyWorldFix] Converting McRegion chunks: {}/{} (~{} chunks/s)",
+                                                                        finished, total, finished * 1000L / ms);
+                                                        }
+                                                        return RegionIo.compressChunk(pair[0], raw, upgraded);
                                                 } catch (Exception e) {
                                                         LegacyWorldFix.LOGGER.error("[LegacyWorldFix] Skipping unreadable chunk in {} (slot {}): {}", pair[0], raw.slot(), e.toString());
                                                         return null;
@@ -475,7 +491,17 @@ public final class LegacyMcRegionUpgrader {
          * JIT) so the whole pool does not stampede the DFU's lazily-built rule
          * cache at once - that would both duplicate the composition work and race
          * on the cache's non-thread-safe {@code computeIfAbsent}.
+         *
+         * <p>The worker pool is shared and never shut down (daemon threads): a
+         * conversion pass creates no threads, so multi-world servers pay the
+         * thread churn once instead of per world and per phase.
          */
+        private static final ExecutorService CONVERTER_POOL = Executors.newFixedThreadPool(PARALLELISM, runnable -> {
+                Thread thread = new Thread(runnable, "LegacyWorldFix-Converter");
+                thread.setDaemon(true);
+                return thread;
+        });
+
         static <T> List<T> runInParallelCollect(List<Callable<T>> tasks) throws IOException {
                 if (tasks.isEmpty()) {
                         return List.of();
@@ -494,11 +520,7 @@ public final class LegacyMcRegionUpgrader {
                         }
                 }
 
-                ExecutorService pool = Executors.newFixedThreadPool(PARALLELISM, runnable -> {
-                        Thread thread = new Thread(runnable, "LegacyWorldFix-Converter");
-                        thread.setDaemon(true);
-                        return thread;
-                });
+                ExecutorService pool = CONVERTER_POOL;
                 try {
                         try {
                                 List<T> results = new ArrayList<>(tasks.size());
@@ -524,7 +546,8 @@ public final class LegacyMcRegionUpgrader {
                                 throw new IOException("Interrupted during conversion", e);
                         }
                 } finally {
-                        pool.shutdown();
+                        // Shared daemon pool: no shutdown, it outlives this conversion
+                        // and is reused by the next world or phase.
                 }
         }
 
@@ -623,10 +646,19 @@ public final class LegacyMcRegionUpgrader {
                                 fixEntityHealth(entityTag);
                         }
                 }
-                level.put("Entities", entities);
+                // An EMPTY Entities list is deliberately not written into the DFU
+                // input: the chain's ~160 entity fixers pay their typed-list rewrite
+                // (optic match + structural type comparisons) for a list they leave
+                // empty, while an absent key short-circuits. Output equivalence is
+                // proven modulo absent-vs-empty-list (docs/BENCH-PERF-1.6.0.txt):
+                // vanilla reads a missing list as empty and writes the lists back on
+                // the chunk's first save.
+                if (!entities.isEmpty()) {
+                        level.put("Entities", entities);
+                }
 
                 Tag tileEntities = oldLevel.get("TileEntities");
-                if (tileEntities != null) {
+                if (tileEntities != null && !(tileEntities instanceof ListTag tileEntityList && tileEntityList.isEmpty())) {
                         level.put("TileEntities", tileEntities.copy());
                 }
 

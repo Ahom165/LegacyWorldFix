@@ -135,6 +135,13 @@ final class PreRegionUpgrader {
                         return 0L;
                 }
 
+                // Live progress: one line every ~10% so long conversions show their
+                // actual rate on the user's machine (and make parallelism visible).
+                int total = chunks.size();
+                java.util.concurrent.atomic.AtomicInteger done = new java.util.concurrent.atomic.AtomicInteger();
+                int step = Math.max(1, total / 10);
+                long startNanos = System.nanoTime();
+
                 Map<Path, RegionTarget> targets = new ConcurrentHashMap<>();
                 List<Callable<Long>> tasks = chunks.stream().<Callable<Long>>map(chunk -> () -> {
                         CompoundTag root;
@@ -160,6 +167,12 @@ final class PreRegionUpgrader {
                         synchronized (target) {
                                 target.writer().writeCompressedChunk(slotOf(chunk.x(), chunk.z()), timestampOf(chunk.file()), compressed);
                                 target.convertedFiles().add(chunk.file());
+                        }
+                        int finished = done.incrementAndGet();
+                        if (finished % step == 0 || finished == total) {
+                                long ms = Math.max(1L, (System.nanoTime() - startNanos) / 1_000_000L);
+                                LegacyWorldFix.LOGGER.info("[LegacyWorldFix] Converting pre-region chunks: {}/{} (~{} chunks/s)",
+                                        finished, total, finished * 1000L / ms);
                         }
                         return 1L;
                 }).toList();
