@@ -9,6 +9,31 @@ Il restaure les conversions **pré-Anvil** que Mojang a retirées du jeu à part
 série 26.x, et remet ainsi les mondes de **Minecraft 1.0 (novembre 2011)** — et de toute la
 zone McRegion (Beta 1.3 → 1.1.2) — sur les rails de mise à jour officielles, jusqu'à la 26.3.
 
+**Nouveau dans la 1.5.0 — recodage du hot path DFU** (réponse à « recode les morceaux
+du DFU mal opti ») :
+
+- **les sections 100 % air ne traversent plus la chaîne de datafixers**. Le cylindre de
+  ciel des mondes Alpha (jusqu'à la moitié d'un chunk) était transformé par le DFU en
+  sections « gonflées » (palette de 9 entrées + ~2 Ko de data par section de ciel) que
+  vanilla ne produit jamais à la sauvegarde — il omet ces sections. Retirées à la
+  source, la sortie contient des sections minimales (ou rien), les `.mca` sont plus
+  petits et le DFU marche sur moins de données. **Équivalence prouvée** : 72 chunks de
+  terrains variés, 264 sections retirées — sections conservées identiques octet pour
+  octet après la chaîne complète, sections retirées recréées par la chaîne elle-même en
+  sections minimales `[air]` (voir `docs/BENCH-PERF-1.5.0.txt`) ;
+- **le datafixer est pré-construit en arrière-plan** dès le lancement du jeu
+  (`Datafixer ready in X ms (prebuilt in background)`) : ~0,8 s de construction du
+  singleton + composition de règle passent derrière l'écran de titre au lieu de
+  s'ajouter à la conversion ;
+- **écriture des `.mca` et suppression des fichiers legacy parallélisées** (un task par
+  region file ; sur NTFS, les ~1195 petits fichiers `c.<x>.<z>.dat` + dossiers base36
+  coûtaient ~1 s en séquentiel).
+
+Honnêteté sur les chiffres : le moteur DataFixerUpper lui-même (code Mojang, partagé
+avec l'upgrade vanilla) reste le coût dominant (~35 ms/chunk à JIT chaud, ~fixe par
+chunk) ; il est désormais réparti sur **tous les cœurs logiques**, et la ligne de log
+`~X ms/chunk on N threads` dit exactement ce que fait la machine.
+
 **Nouveau dans la 1.1.0** : prise en charge des mondes **encore plus vieux**, antérieurs au
 format McRegion — **Infdev/Alpha** (chunks individuels, mi-2010 → Beta 1.2) et
 **Indev/Classic** (carte fixe unique, décembre 2009) — ainsi que des optimisations de
