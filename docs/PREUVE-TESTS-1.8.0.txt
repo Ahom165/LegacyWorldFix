@@ -1,0 +1,68 @@
+LegacyWorldFix 1.8.0 — preuves : la conversion passe au lancement du monde
+===========================================================================
+
+Changement (demande : "ça me bloque sur l'écran loading world list pendant que ça se
+fait, tu pourrais faire la conversion que quand on lance le monde ?")
+
+AVANT (<= 1.7.0)
+  LevelStorageSource#makeLevelSummary (parcouru au chargement de la liste des mondes)
+  convertissait chaque monde legacy trouvé -> "Loading world list" bloqué pendant
+  toute la conversion.
+
+APRES (1.8.0)
+  - makeLevelSummary : détection légère uniquement (lecture level.dat + listing
+    dossier). Mondes legacy : patch du tag EN MEMOIRE (affichage normal, aucun
+    disque écrit). Mondes déjà convertis en ancien layout : migration dossier
+    (déplacements de fichiers rapides, inchangé 1.7.0).
+  - NOUVEAU mixin client WorldOpenFlows#openWorld(String, Runnable) (HEAD,
+    cancellable) : au clic sur "Jouer", si le monde est legacy ou en ancien
+    layout -> écran LegacyConversionScreen (nouveau), conversion sur un thread
+    ouvrier, relance du flux vanilla une fois le monde Anvil.
+  - Ecran : titre + phase live (Préparation / chunks x/y avec barre / écriture
+    des regions), compteurs partages avec les logs console
+    (LegacyMcRegionUpgrader.ConversionPhase : PREPARE/CHUNKS/WRITING).
+    Echec : message + bouton Retour, level.dat intact.
+  - Langues : assets/legacyworldfix/lang/{en_us,fr_fr}.json.
+  - Serveur dédié : inchangé (conversion au démarrage avant chargement).
+
+PREUVE 1 — sonde LaunchFlowProbe (même chemin que le mixin, hors UI)
+  Monde synthétique McRegion 1.0 (make_test_worlds.py) :
+    detectFormat(before) = MCREGION
+    needsLayoutMigration(before) = false
+    phase -> PREPARE (done=0, total=-1)
+    phase -> CHUNKS (done=0, total=2)
+    phase -> WRITING (done=0, total=-1)
+    detectFormat(after) = ANVIL
+    prepareWorld(again) = false in 0 ms        <- 2e appel : no-op (relance du flux vanilla immédiate)
+    PROBE OK
+  Monde synthétique Beta 1.2 (pre-region, 7 chunks) : PROBE OK (mêmes phases).
+
+PREUVE 2 — sonde OldLayoutProbe (monde converti par un ancien couple mod/jeu)
+    detectFormat = ANVIL
+    needsLayoutMigration(before) = true
+    prepareWorld = false                       <- migration, pas de reconversion
+    [LegacyWorldFix] World ... uses the current per-dimension storage layout - converted folders moved accordingly
+    OLD-LAYOUT PROBE OK                        <- region/ déplacé vers dimensions/minecraft/overworld/region
+
+PREUVE 3 — E2E serveur dédié 26.3 (jar 1.8.0, monde McRegion frais)
+  Boot + conversion avant chargement, aucun refus vanilla :
+    [LegacyWorldFix] Loaded - worlds saved before 1.6.4 (Indev/Classic, Infdev/Alpha, McRegion, early Anvil) can be upgraded again
+    [LegacyWorldFix] McRegion world detected (level.dat version 19132): .../run/McRegion180
+    [LegacyWorldFix-DFU-Prebuild] Datafixer ready in 3833 ms (built 0 ms, rules composed 3833 ms, prebuilt in background)
+    [LegacyWorldFix] Converted 1 region file(s) / 2 chunk(s) from McRegion to Anvil in 4390 ms (~2195 ms/chunk on 2 threads, data fixes applied in place) - the vanilla upgrade pass is skipped
+    [LegacyWorldFix] Converted 1 legacy world(s) in .../run before server start
+  Contenu du monde vérifié en jeu :
+    CHECK_GOLD_MCREGION_OK                     <- bloc d'or placé en 2011 à sa place
+    System chat: 6, 6, 6 has the following block data: [{count: 1, Slot: 0b, id: "minecraft:tnt"}]   <- coffre + TNT
+    System chat: Pig has the following entity data: 10.0f                                            <- Health float (normalisé depuis le short pré-1.6)
+    System chat: Pig has the following entity data: [I; 1918016153, ...]                             <- UUID attribué
+  "must be opened in an older version" : 0 occurrence. Aucune exception dans le log.
+
+COTE CLIENT (non testable headless)
+  - Signatures vérifiées sur le jar mappé 26.3 : WorldOpenFlows#openWorld(String, Runnable),
+    LevelStorageSource#getLevelPath(String) (= saves/<nom>), Minecraft#setScreenAndShow,
+    Screen#extractRenderState(GuiGraphicsExtractor,int,int,float), GuiGraphicsExtractor
+    #centeredText/#fill, Button$Builder#bounds — le build remappe les mixins (échouerait
+    sinon), defaultRequire=1 (échec bruyant si le point de greffe disparaît).
+  - La logique exécutée par l'écran (prepareWorld + detectFormat) est exactement celle
+    des sondes ci-dessus.

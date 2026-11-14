@@ -155,6 +155,39 @@ final class StorageLayout {
                 }
         }
 
+        /**
+         * Read-only counterpart of {@link #migrateToPerDimensionLayoutIfNeeded}:
+         * true when that method would move at least one folder. Lets the launch
+         * flow decide whether the migration must run before the world opens,
+         * without writing anything.
+         */
+        static boolean needsPerDimensionMigration(Path worldDir) {
+                if (!PER_DIMENSION) {
+                        return false;
+                }
+                try {
+                        if (!isConvertedAnvilWorld(worldDir)) {
+                                return false;
+                        }
+                        if (hasRegionFiles(worldDir.resolve("region"), "*.mca")
+                                && !Files.exists(worldDir.resolve("dimensions").resolve("minecraft").resolve("overworld").resolve("region"))) {
+                                return true;
+                        }
+                        if (hasRegionFiles(worldDir.resolve("DIM-1").resolve("region"), "*.mca")
+                                && !Files.exists(worldDir.resolve("dimensions").resolve("minecraft").resolve("the_nether").resolve("region"))) {
+                                return true;
+                        }
+                        if (hasRegionFiles(worldDir.resolve("DIM1").resolve("region"), "*.mca")
+                                && !Files.exists(worldDir.resolve("dimensions").resolve("minecraft").resolve("the_end").resolve("region"))) {
+                                return true;
+                        }
+                        return Files.isDirectory(worldDir.resolve("players").resolve("data"))
+                                && !Files.exists(worldDir.resolve("playerdata"));
+                } catch (IOException e) {
+                        return false;
+                }
+        }
+
         private static boolean moveRegionDir(Path source, Path target) throws IOException {
                 if (!hasRegionFiles(source, "*.mca")) {
                         return false;

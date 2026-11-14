@@ -87,10 +87,86 @@ public final class LegacyMcRegionUpgrader {
                 /** Infdev / Alpha loose chunk files. */
                 PRE_REGION,
                 /** Indev / Classic fixed map inside level.dat. */
-                INDEV
+                INDEV;
+
+                /** True when the world still needs a conversion pass before the game can read it. */
+                public boolean isLegacy() {
+                        return this == MCREGION || this == PRE_REGION || this == INDEV;
+                }
         }
 
         private static final Map<Path, Object> WORLD_LOCKS = new ConcurrentHashMap<>();
+
+        /**
+         * Coarse phase of the conversion currently running in this process,
+         * polled by the client launch screen (see {@code LegacyConversionScreen}).
+         * Plain volatile/atomic reads: safe to call from the render thread while
+         * the conversion workers update them.
+         */
+        public enum ConversionPhase {
+                /** Nothing running. */
+                IDLE,
+                /** Scanning containers / player data / worldgen settings - no chunk count known yet. */
+                PREPARE,
+                /** Chunk conversions (shape transform + vanilla datafixers), total known. */
+                CHUNKS,
+                /** Writing Anvil region files / moving folders. */
+                WRITING
+        }
+
+        private static volatile ConversionPhase progressPhase = ConversionPhase.IDLE;
+        private static volatile int progressTotal = -1;
+        private static final AtomicInteger progressDone = new AtomicInteger();
+
+        static void beginPrepareProgress() {
+                progressPhase = ConversionPhase.PREPARE;
+                progressTotal = -1;
+                progressDone.set(0);
+        }
+
+        static void beginChunkProgress(int total) {
+                progressPhase = ConversionPhase.CHUNKS;
+                progressTotal = total;
+                progressDone.set(0);
+        }
+
+        static void beginWriteProgress() {
+                progressPhase = ConversionPhase.WRITING;
+                progressTotal = -1;
+                progressDone.set(0);
+        }
+
+        /** Called by conversion workers; the same counter drives the console logs. */
+        static int chunkProgressDone() {
+                return progressDone.incrementAndGet();
+        }
+
+        public static ConversionPhase currentConversionPhase() {
+                return progressPhase;
+        }
+
+        public static int currentConversionDone() {
+                return progressDone.get();
+        }
+
+        public static int currentConversionTotal() {
+                return progressTotal;
+        }
+
+        public static void clearProgress() {
+                progressPhase = ConversionPhase.IDLE;
+                progressTotal = -1;
+                progressDone.set(0);
+        }
+
+        /**
+         * Read-only check for the launch flow: does this already-Anvil world sit
+         * in a storage layout the running build no longer reads? The migration
+         * itself (cheap, deterministic folder moves) runs in {@link #prepareWorld}.
+         */
+        public static boolean needsLayoutMigration(Path worldDir) {
+                return StorageLayout.needsPerDimensionMigration(worldDir);
+        }
 
         private LegacyMcRegionUpgrader() {
         }
@@ -102,8 +178,7 @@ public final class LegacyMcRegionUpgrader {
 
         /** True when the world still uses any storage this mod can upgrade. */
         public static boolean isLegacyWorld(Path worldDir) {
-                LegacyFormat format = detectFormat(worldDir);
-                return format == LegacyFormat.MCREGION || format == LegacyFormat.PRE_REGION || format == LegacyFormat.INDEV;
+                return detectFormat(worldDir).isLegacy();
         }
 
         /**
@@ -223,14 +298,19 @@ public final class LegacyMcRegionUpgrader {
         public static boolean convertWorld(Path worldDir) {
                 Object lock = WORLD_LOCKS.computeIfAbsent(worldDir.toAbsolutePath().normalize(), key -> new Object());
                 synchronized (lock) {
-                        LegacyFormat format = detectFormat(worldDir);
-                        String generatorId = generatorIdFor(readLevelDat(worldDir));
-                        return switch (format) {
-                                case MCREGION -> convertMcRegionWorld(worldDir, generatorId);
-                                case PRE_REGION -> convertPreRegionWorld(worldDir, generatorId);
-                                case INDEV -> IndevConverter.convertWorld(worldDir, readLevelDat(worldDir));
-                                default -> true;
-                        };
+                        beginPrepareProgress();
+                        try {
+                                LegacyFormat format = detectFormat(worldDir);
+                                String generatorId = generatorIdFor(readLevelDat(worldDir));
+                                return switch (format) {
+                                        case MCREGION -> convertMcRegionWorld(worldDir, generatorId);
+                                        case PRE_REGION -> convertPreRegionWorld(worldDir, generatorId);
+                                        case INDEV -> IndevConverter.convertWorld(worldDir, readLevelDat(worldDir));
+                                        default -> true;
+                                };
+                        } finally {
+                                clearProgress();
+                        }
                 }
         }
 
@@ -362,7 +442,7 @@ public final class LegacyMcRegionUpgrader {
                                 rawTotal += rawChunksBySource.getOrDefault(pair[0], List.of()).size();
                         }
                         final int total = rawTotal;
-                        java.util.concurrent.atomic.AtomicInteger done = new java.util.concurrent.atomic.AtomicInteger();
+                        beginChunkProgress(total);
                         int step = Math.max(1, total / 10);
                         long phaseStart = System.nanoTime();
                         for (Path[] pair : pairs) {
@@ -377,7 +457,7 @@ public final class LegacyMcRegionUpgrader {
                                                 try {
                                                         CompoundTag chunk = RegionIo.decodeChunk(raw);
                                                         CompoundTag upgraded = transformAndUpgradeChunk(chunk, dimensionId, generatorId);
-                                                        int finished = done.incrementAndGet();
+                                                        int finished = chunkProgressDone();
                                                         if (finished % step == 0 || finished == total) {
                                                                 long ms = Math.max(1L, (System.nanoTime() - phaseStart) / 1_000_000L);
                                                                 LegacyWorldFix.LOGGER.info("[LegacyWorldFix] Converting McRegion chunks: {}/{} (~{} chunks/s)",
@@ -406,6 +486,7 @@ public final class LegacyMcRegionUpgrader {
                                 }
                         }
 
+                        beginWriteProgress();
                         List<Callable<Long>> writes = new ArrayList<>();
                         for (Path[] pair : pairs) {
                                 writes.add(() -> {

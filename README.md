@@ -9,6 +9,21 @@ Il restaure les conversions **pré-Anvil** que Mojang a retirées du jeu à part
 série 26.x, et remet ainsi les mondes de **Minecraft 1.0 (novembre 2011)** — et de toute la
 zone McRegion (Beta 1.3 → 1.1.2) — sur les rails de mise à jour officielles, jusqu'à la 26.3.
 
+**Nouveau dans la 1.8.0 — la conversion se fait quand tu lances le monde, plus au chargement de la liste** :
+
+- avant : la conversion tournait pendant le chargement de la liste des mondes — l'écran
+  *« Loading world list »* restait bloqué le temps de convertir (problème remonté en jeu) ;
+- maintenant : la liste se charge **immédiatement** (le mod ne fait qu'une détection
+  légère par monde) et la conversion démarre **au clic sur « Jouer »**, sur un écran
+  dédié avec **barre de progression en temps réel** (phases : préparation → chunks
+  x/y → écriture des regions, mêmes compteurs que les logs console) ;
+- à la fin de la conversion, le flux vanilla reprend tout seul et le monde s'ouvre
+  normalement. En cas d'échec, un écran d'erreur avec bouton *Retour* s'affiche et
+  `level.dat` reste intact (rejouable) ;
+- écran traduit (anglais + français), aucune action à faire ;
+- sur **serveur dédié**, rien ne change : la conversion reste faite au démarrage
+  avant le chargement du monde.
+
 **Nouveau dans la 1.7.0 — le reste du pipeline DFU réécrit de zéro + support du nouveau layout de stockage 26.x** :
 
 - **support du nouveau layout par-dimension** : les builds 26.x récents (même id
@@ -254,14 +269,15 @@ du chemin « schéma 99 », le monde est jouable tel quel.
 ## Installation
 
 1. Installe Fabric Loader 0.20.1 ou plus récent pour Minecraft 26.3.
-2. Dépose `legacyworldfix-1.3.0+mc26.3.jar` dans le dossier `mods/`.
+2. Dépose `legacyworldfix-1.8.0+mc26.3.jar` dans le dossier `mods/`.
 3. Lance le jeu (client) ou le serveur. Aucune configuration.
 
 ### Utilisation (client)
 
-Ouvre la liste des mondes : le monde apparaît normalement (le mod le convertit en Anvil
-avec toutes ses données à ce moment, regarde les logs). Clique dessus : le monde charge
-directement — plus de flux « Mettre à jour et jouer », plus d'attente.
+Ouvre la liste des mondes : elle s'affiche tout de suite, le monde legacy apparaît
+normalement. Clique sur **Jouer** : un écran « Conversion du monde legacy » s'affiche avec
+la progression (nombre de chunks, barre), puis le monde s'ouvre tout seul. Regarde les
+logs pour le détail (taux chunks/s, temps total).
 
 ### Utilisation (serveur dédié)
 
@@ -300,10 +316,13 @@ Java 25 est requis (c'est la version imposée par Minecraft 26.3). Le jar est pr
 
 - Cible : Fabric Loader 0.20.1, Minecraft 26.3 (classes du jeu dé-obfusquées : le mod n'a
   besoin d'aucun mappings), Java 25.
-- Un seul mixin : `LevelStorageSource#makeLevelSummary` (HEAD), le point de passage unique
-  des résumés de mondes côté client (liste, quick play) et côté serveur (`Main` →
-  `fixAndGetSummaryFromTag`). Le tag reçu étant le composé `Data`, la greffe met à jour
-  `version`/`LevelName` directement dedans.
+- Deux mixins : `LevelStorageSource#makeLevelSummary` (HEAD) — détection légère des mondes
+  legacy au chargement de la liste (patch du tag en mémoire, migration de layout des mondes
+  déjà convertis, **plus aucune conversion lourde**) — et, côté client,
+  `WorldOpenFlows#openWorld(String, Runnable)` (HEAD, cancellable) qui intercepte le clic
+  sur « Jouer », affiche `LegacyConversionScreen` (progression en direct) et relance le flux
+  vanilla une fois le monde converti. Le tag reçu par `makeLevelSummary` étant le composé
+  `Data`, la greffe met à jour `version`/`LevelName` directement dedans.
 - IO région réécrite en interne (lecture gzip/zlib/non compressé, écriture zlib), sans
   dépendre de la classe `RegionFile` de 26.x (qui gère désormais des fichiers de chunks
   externes). Un `AnvilRegionWriter` unique sert aux trois convertisseurs.

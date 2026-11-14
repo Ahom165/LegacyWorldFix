@@ -6,6 +6,9 @@
 	"mixins": [
 		"LevelStorageSourceMixin"
 	],
+	"client": [
+		"WorldOpenFlowsMixin"
+	],
 	"injectors": {
 		"defaultRequire": 1
 	}

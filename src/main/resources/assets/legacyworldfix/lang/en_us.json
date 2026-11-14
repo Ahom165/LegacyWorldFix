@@ -1,0 +1,8 @@
+{
+  "legacyworldfix.converting.title": "Converting legacy world",
+  "legacyworldfix.converting.preparing": "Preparing conversion...",
+  "legacyworldfix.converting.chunks": "Upgrading chunks: %s / %s",
+  "legacyworldfix.converting.writing": "Writing region files...",
+  "legacyworldfix.converting.failed": "Conversion failed - see the game log for details.",
+  "legacyworldfix.converting.back": "Back"
+}

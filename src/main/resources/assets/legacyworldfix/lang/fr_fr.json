@@ -1,0 +1,8 @@
+{
+  "legacyworldfix.converting.title": "Conversion du monde legacy",
+  "legacyworldfix.converting.preparing": "Préparation de la conversion...",
+  "legacyworldfix.converting.chunks": "Mise à jour des chunks : %s / %s",
+  "legacyworldfix.converting.writing": "Écriture des fichiers region...",
+  "legacyworldfix.converting.failed": "Échec de la conversion - voir le log du jeu pour plus de détails.",
+  "legacyworldfix.converting.back": "Retour"
+}

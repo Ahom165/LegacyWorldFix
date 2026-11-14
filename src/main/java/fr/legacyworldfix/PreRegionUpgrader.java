@@ -137,8 +137,9 @@ final class PreRegionUpgrader {
 
                 // Live progress: one line every ~10% so long conversions show their
                 // actual rate on the user's machine (and make parallelism visible).
+                // The same counter feeds the client launch screen.
                 int total = chunks.size();
-                java.util.concurrent.atomic.AtomicInteger done = new java.util.concurrent.atomic.AtomicInteger();
+                LegacyMcRegionUpgrader.beginChunkProgress(total);
                 int step = Math.max(1, total / 10);
                 long startNanos = System.nanoTime();
 
@@ -168,7 +169,7 @@ final class PreRegionUpgrader {
                                 target.writer().writeCompressedChunk(slotOf(chunk.x(), chunk.z()), timestampOf(chunk.file()), compressed);
                                 target.convertedFiles().add(chunk.file());
                         }
-                        int finished = done.incrementAndGet();
+                        int finished = LegacyMcRegionUpgrader.chunkProgressDone();
                         if (finished % step == 0 || finished == total) {
                                 long ms = Math.max(1L, (System.nanoTime() - startNanos) / 1_000_000L);
                                 LegacyWorldFix.LOGGER.info("[LegacyWorldFix] Converting pre-region chunks: {}/{} (~{} chunks/s)",
@@ -187,6 +188,7 @@ final class PreRegionUpgrader {
                 // task rethrows after all tasks finished, leaving the world an honest
                 // pre-region world (level.dat untouched) whose retry converts the
                 // remaining files; saves that succeeded keep their regions.
+                LegacyMcRegionUpgrader.beginWriteProgress();
                 List<Callable<Long>> writes = targets.values().stream()
                         .<Callable<Long>>map(target -> () -> {
                                 target.writer().saveTo(target.file());
